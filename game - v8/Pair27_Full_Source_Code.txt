@@ -1,0 +1,4032 @@
+============================================================
+PROJECT: DRAGON CHESS MAZE - FULL SOURCE CODE
+TEAM: SHYAM PARIKH & SAMUEL BONCIK [cite: 40]
+============================================================
+
+
+============================================================
+SOURCE FILE: ai_arena.py
+============================================================
+
+import os
+import sys
+import time
+import threading
+import pygame as pg
+
+# Change this to True to disable Numba's C-compilation.
+DISABLE_JIT = False 
+if DISABLE_JIT:
+    os.environ['NUMBA_DISABLE_JIT'] = '1'
+    print("WARNING: Numba JIT is DISABLED. Running in pure Python...")
+else:
+    print("Numba JIT is ENABLED. Running at maximum speed...")
+
+from chess_engine import Chess, decode_move
+from dragon import Dragon
+import constants
+
+class VisualArena:
+    def __init__(self, ai_white, ai_black):
+        pg.init()
+        self.ai_white = ai_white
+        self.ai_black = ai_black
+        
+        self.board_size = 800
+        self.panel_width = 400
+        self.screen = pg.display.set_mode((self.board_size + self.panel_width, self.board_size))
+        pg.display.set_caption(f"AI Arena | JIT Enabled: {not DISABLE_JIT}")
+        
+        self.font = pg.font.Font(None, 36)
+        self.large_font = pg.font.Font(None, 50)
+        
+        self.engine = Chess(load_graphic=True)
+        self.engine.load_images()
+        self.sq_size = self.board_size // 8
+        
+        self.move_history = []
+        self.white_times = []
+        self.black_times = []
+        
+        self.ai_thinking = False
+        self.calculated_move = None
+        self.game_over = False
+        self.result_msg = ""
+
+    def draw_board(self):
+        colors = [(234, 251, 200), (119, 154, 88)] 
+        for r in range(8):
+            for c in range(8):
+                color = colors[(r + c) % 2]
+                rect = pg.Rect(c * self.sq_size, r * self.sq_size, self.sq_size, self.sq_size)
+                pg.draw.rect(self.screen, color, rect)
+                
+                if self.move_history:
+                    last_start, last_end, _ = decode_move(self.move_history[-1])
+                    sq = r * 8 + c
+                    if sq == last_start or sq == last_end:
+                        highlight = pg.Surface((self.sq_size, self.sq_size))
+                        highlight.set_alpha(100)
+                        highlight.fill((255, 255, 0))
+                        self.screen.blit(highlight, (c * self.sq_size, r * self.sq_size))
+
+                piece = self.engine.board[r * 8 + c]
+                if piece != 0:
+                    p_type = piece & 7
+                    is_black = bool(piece & 8)
+                    color_str = 'black' if is_black else 'white'
+                    type_names = (None, 'pawn', 'knight', 'bishop', 'rook', 'queen', 'king')
+                    key = f"{color_str}_{type_names[p_type]}"
+                    
+                    if key in self.engine.org_imgs:
+                        img = pg.transform.smoothscale(self.engine.org_imgs[key], (self.sq_size, self.sq_size))
+                        self.screen.blit(img, rect)
+                    else:
+                        txt = self.font.render(type_names[p_type][0].upper(), True, (0,0,0) if not is_black else (255,255,255))
+                        self.screen.blit(txt, txt.get_rect(center=rect.center))
+
+    def draw_stats_panel(self):
+        panel_rect = pg.Rect(self.board_size, 0, self.panel_width, self.board_size)
+        pg.draw.rect(self.screen, (30, 30, 40), panel_rect)
+        pg.draw.line(self.screen, (255, 255, 255), (self.board_size, 0), (self.board_size, self.board_size), 3)
+
+        x_offset = self.board_size + 20
+        
+        jit_status = "DISABLED (Slow)" if DISABLE_JIT else "ENABLED (Fast)"
+        color = (255, 50, 50) if DISABLE_JIT else (50, 255, 50)
+        self.screen.blit(self.font.render(f"Numba JIT: {jit_status}", True, color), (x_offset, 20))
+        
+        current_move_num = (len(self.move_history) // 2) + 1
+        
+        self.screen.blit(self.large_font.render("Match Stats", True, (255, 215, 0)), (x_offset, 80))
+        self.screen.blit(self.font.render(f"Current Move: {current_move_num}", True, (200, 200, 255)), (x_offset, 115))
+        
+        w_avg = sum(self.white_times) / len(self.white_times) if self.white_times else 0
+        w_last = self.white_times[-1] if self.white_times else 0
+        self.screen.blit(self.font.render(f"White: {self.ai_white.name}", True, (255, 255, 255)), (x_offset, 170))
+        self.screen.blit(self.font.render(f"Last Move: {w_last:.3f}s", True, (200, 200, 200)), (x_offset, 210))
+        self.screen.blit(self.font.render(f"Avg Time:  {w_avg:.3f}s", True, (200, 200, 200)), (x_offset, 250))
+
+        b_avg = sum(self.black_times) / len(self.black_times) if self.black_times else 0
+        b_last = self.black_times[-1] if self.black_times else 0
+        self.screen.blit(self.font.render(f"Black: {self.ai_black.name}", True, (255, 255, 255)), (x_offset, 320))
+        self.screen.blit(self.font.render(f"Last Move: {b_last:.3f}s", True, (200, 200, 200)), (x_offset, 360))
+        self.screen.blit(self.font.render(f"Avg Time:  {b_avg:.3f}s", True, (200, 200, 200)), (x_offset, 400))
+
+        if not self.game_over:
+            turn_txt = "White is thinking..." if self.engine.white_turn else "Black is thinking..."
+            self.screen.blit(self.large_font.render(turn_txt, True, (0, 255, 255)), (x_offset, 500))
+        else:
+            self.screen.blit(self.large_font.render(self.result_msg, True, (255, 50, 50)), (x_offset, 500))
+
+    def _think_thread(self, current_ai):
+        start_t = time.perf_counter()
+        move = current_ai.get_move(self.engine, current_ai.dragon_level)
+        time_taken = time.perf_counter() - start_t
+        
+        self.calculated_move = move
+        if self.engine.white_turn:
+            self.white_times.append(time_taken)
+        else:
+            self.black_times.append(time_taken)
+
+    def run(self):
+        clock = pg.time.Clock()
+        running = True
+
+        while running:
+            for event in pg.event.get():
+                if event.type == pg.QUIT:
+                    running = False
+
+            if not self.game_over and not self.ai_thinking:
+                if self.engine.is_checkmate():
+                    winner = "Black" if self.engine.white_turn else "White"
+                    self.result_msg = f"CHECKMATE! {winner} wins."
+                    self.game_over = True
+                elif self.engine.is_stalemate():
+                    self.result_msg = "STALEMATE! DRAW."
+                    self.game_over = True
+                
+                # Check for the turn limit (150 moves = 75 turns)
+                elif len(self.move_history) > 150:
+                    score = self.engine.eval_board()
+                    
+                    if score > 0:
+                        self.result_msg = "TIME LIMIT! White wins by points."
+                    elif score < 0:
+                        self.result_msg = "TIME LIMIT! Black wins by points."
+                    else:
+                        self.result_msg = "TIME LIMIT! Perfect Tie."
+                        
+                    self.game_over = True
+                else:
+                    self.ai_thinking = True
+                    current_ai = self.ai_white if self.engine.white_turn else self.ai_black
+                    threading.Thread(target=self._think_thread, args=(current_ai,), daemon=True).start()
+
+            if self.ai_thinking and self.calculated_move is not None:
+                self.engine.make_move(self.calculated_move)
+                self.move_history.append(self.calculated_move)
+                self.calculated_move = None
+                self.ai_thinking = False
+
+            self.screen.fill((0, 0, 0))
+            self.draw_board()
+            self.draw_stats_panel()
+            pg.display.flip()
+            clock.tick(60)
+
+        pg.quit()
+
+if __name__ == "__main__":
+    
+    # Changed drag_time_limit from 10 to 0 to speed up testing
+    ai_1 = Dragon(name="White_Dragon", dragon_level=2, drag_time_limit=0)
+    ai_2 = Dragon(name="Black_Dragon", dragon_level=2, drag_time_limit=0)
+    
+    arena = VisualArena(ai_1, ai_2)
+    
+    arena.engine = Chess(load_graphic=True) 
+    arena.engine.load_images()
+    
+    arena.run()
+
+============================================================
+SOURCE FILE: battle.py
+============================================================
+
+from chess_engine import Chess, decode_move
+from dragon import Dragon
+from player import Player
+import pygame as pg
+import threading
+import numpy, random
+
+class Battle:
+    def __init__(self, surface, dragon_level, dragon_name, player=Player((2,2)), super_mode=0):
+        self.surface = surface
+        self.super_mode = super_mode
+        self.chess_engine = Chess(super_mode=self.super_mode) 
+        self.is_active = True
+
+        self.selected_sq = None
+        self.hover_sq = None
+        self.hover_moves = []
+
+        self.player = player
+        self.time_limit_bonus = max(self.player.dragons_beaten, 0) + player.time_limit_of_AI
+        self.player.can_move = False
+        self.dragon = Dragon(dragon_name, dragon_level)
+        self.dragon_level = dragon_level
+        self.game_over_processed = False
+        self.ai_thinking = False
+        self.ai_thread = None
+        self.calculated_move = None
+
+        self._last_width, self._last_height = 0, 0
+        self.sqsize = 1
+        self.x_offset, self.y_offset = 0, 0
+        self.resized = False
+
+        self.chess_engine.berserker_king = player.berserker_king
+        self._apply_board_skills()
+    
+    def _apply_board_skills(self):
+        board = self.chess_engine.board
+        if self.player.pawn_shield:
+            i = 0
+            while True:
+                sq = random.choice(list(range(40, 48)))
+                if board[sq] == 0:
+                    board[sq] = 1
+                    break
+                i += 1
+                if i > 10: break
+        if self.player.royal_guard:
+            i = 0
+            while True:
+                sq = random.choice(list(range(48, 56)))
+                if board[sq] == 1:
+                    board[sq] = 5
+                    break
+                i += 1
+                if i > 10: break
+        if self.player.pawn_shield or self.player.royal_guard:
+            self.chess_engine.mid_game_score = 0
+            self.chess_engine.end_game_score = 0
+            self.chess_engine.phase = 0
+            self.chess_engine.calc_board_score()
+            self.chess_engine.max_phase = max(24, self.chess_engine.phase)
+
+    def handle_event(self, event):
+        self._update_layout()
+
+        if event.type == pg.MOUSEBUTTONDOWN:
+            mouse_x, mouse_y = event.pos
+            col = (mouse_x - self.x_offset) // self.sqsize
+            row = (mouse_y - self.y_offset) // self.sqsize
+            if 0<= row < 8 and 0 <= col < 8:
+                sq = row * 8 + col
+                self.click_process(sq)
+        
+        if event.type == pg.MOUSEMOTION:
+            mouse_x, mouse_y = event.pos
+            col = (mouse_x - self.x_offset) // self.sqsize
+            row = (mouse_y - self.y_offset) // self.sqsize
+
+            if 0 <= row < 8 and 0 <= col < 8:
+                sq = row * 8 + col
+                if self.hover_sq != sq:
+                    self.hover_sq = sq
+                    self.update_hover_moves()
+            else:
+                if self.hover_sq is not None:
+                    self.hover_sq = None
+                    self.hover_moves = []
+        
+    def update_hover_moves(self):
+        self.hover_moves = []
+        target_sq = self.selected_sq if self.selected_sq is not None else self.hover_sq
+        if target_sq is not None:
+            piece = self.chess_engine.board[target_sq]
+            if piece != 0 and not (piece & 8) and self.chess_engine.white_turn:
+                for move in self.chess_engine.get_valid_moves():
+                    start, end, flag = decode_move(move)
+                    if start == target_sq:
+                        self.hover_moves.append(end)
+
+    
+    def click_process(self, sq):
+        if self.selected_sq is None:
+            piece = self.chess_engine.board[sq]
+            if piece != 0:
+                is_black = bool(piece  & 8)
+                if self.chess_engine.white_turn and not is_black:
+                    self.selected_sq = sq
+    
+        else:
+            if self.selected_sq == sq:
+                self.selected_sq = None
+                return
+            move_to_make = None
+            for move in  self.chess_engine.get_valid_moves():
+                start, end, flag = decode_move(move)
+                if start == self.selected_sq and end == sq:
+                    move_to_make = move
+                    break
+            if move_to_make is not None:
+                self.chess_engine.make_move(move_to_make)
+                self.selected_sq = None
+                self.check_game_over(self.player)
+            else:
+                n_piece = self.chess_engine.board[sq]
+                if self.chess_engine.white_turn and n_piece != 0 and not (n_piece & 8):
+                    self.selected_sq = sq
+                else:
+                    self.selected_sq = None
+        self.update_hover_moves()
+
+    def update(self):
+        if not self.chess_engine.white_turn and not self.game_over_processed:
+            if not self.ai_thinking:
+                self.trigger_dragon_move()
+            elif self.calculated_move is not None:
+                self.chess_engine.make_move(self.calculated_move)
+                self.check_game_over(self.player)
+
+                self.ai_thinking = False
+                self.calculated_move = None
+                self.ai_thread = None
+
+    def trigger_dragon_move(self):
+        self.ai_thinking = True
+        self.calculated_move = None
+
+        chess_engine_clone = self.chess_engine.clone()
+
+        self.ai_thread = threading.Thread(target=self._calculate_move_thread,
+                                          args=(chess_engine_clone,))
+        self.ai_thread.start()
+
+    def _calculate_move_thread(self, chess_engine_clone):
+        self.calculated_move = self.dragon.get_move(chess_engine_clone, self.dragon_level)
+
+    def player_won(self):
+        if self.game_over_processed: return
+        self.game_over_processed = True
+        self.player.dragons_beaten += 1
+        self.player.playing_chess = False
+        self.player.can_move = True
+        self.update_score(self.dragon_level)
+    
+    def player_lost(self):
+        if self.game_over_processed: return
+        self.game_over_processed = True
+
+        if self.player.second_wind and not self.player._second_wind_used:
+            self.player._second_wind_used = True
+            print("Second Wind!")
+            self.chess_engine = Chess(super_mode=self.super_mode)
+            self.chess_engine.berserker_king = self.player.berserker_king
+            self._apply_board_skills()
+            self.game_over_processed = False
+            return
+        if self.player.kings_ransom and self.player.score >= 500:
+            self.player.score -= 500
+            print("King's Random paid - 500 pts spent to survive!")
+            self.chess_engine = Chess(super_mode=self.super_mode)
+            self.chess_engine.berserker_king = self.player.berserker_king
+            self._apply_board_skills()
+            self.game_over_processed = False
+            return
+        self.player.lives -= 1
+        self.player.playing_chess = False
+        self.player.can_move = True
+        print("Lost a Life! You can do it!")
+
+    def update_score(self, difficulty):
+        score = (difficulty + 1)*100
+        if self.player.blitz_specialist and len(self.chess_engine.move_log) <= 40:
+            score *= 2
+            print("Blitz Specialist! Double points!")
+        if self.player.extra_spoils:
+            score = int(score * 1.25)
+        
+        self.player.score += score
+    
+    def check_game_over(self, player):
+        if self.chess_engine.is_checkmate():
+            if self.chess_engine.white_turn:
+                self.player_lost()
+            else:
+                self.player_won()
+            return True
+        elif self.chess_engine.is_stalemate():
+            if player.peace_treaty:
+                print("Peace Treaty - stalemate ignored!")
+                return False
+            print("Good Progress! Try again!")
+            player.playing_chess = False
+            return True
+        return False
+    
+    def _update_layout(self):
+        curr_w, curr_h = self.surface.get_size()
+
+        if curr_w != self._last_width or curr_h != self._last_height:
+            self._last_width, self._last_height = curr_w, curr_h
+
+            avail_width = curr_w - 200
+            self.sqsize = min(avail_width, curr_h) // 8
+            if self.sqsize < 1: self.sqsize = 1
+            self.x_offset = (avail_width - (self.sqsize * 8)) // 2
+            self.y_offset = (curr_h - (self.sqsize * 8)) // 2
+
+============================================================
+SOURCE FILE: battle_scene.py
+============================================================
+
+from scene import Scene
+from battle import Battle
+import pygame as pg
+from menu_scenes import EndScreen
+from ui import Button
+import constants
+
+class BattleScene(Scene):
+    def __init__(self, game, is_boss=False, super_mode=0): 
+        super().__init__(game)
+        pg.event.set_grab(False)
+        pg.mouse.set_visible(True)
+
+        drag_name = "King" if is_boss else "Dragon Minion"
+        self.battle = Battle(
+            surface=game.graphic2d_surf,
+            dragon_level=constants.BOSS_DRAG_LEVEL if is_boss else constants.MINION_DRAG_LEVEL,
+            dragon_name= drag_name,
+            player=game.player,
+            super_mode=super_mode
+        )
+        width, height = game.graphic2d_surf.get_size()
+        self.quit_button = Button(width - 190, height - 60, 180, 50, game.graphic2d_surf, 
+                               on_click=self.surrender, 
+                               text="SURRENDER", ACTIVE_COLOR=(255, 80, 80))
+        self.resolved = False
+
+    def surrender(self):
+        self.battle.player_lost()
+        print("Player surrendered!")
+        if self.game.player.lives <= 0:
+            print("Game Over by Surrender")
+            pg.event.set_grab(False)
+            pg.mouse.set_visible(True)
+            self.game.change_scene(EndScreen(self.game, victory=False))
+            return
+        self.game.player.playing_chess = False
+        self.game.player.speed = 0.1
+        self._respawn_player()
+        pg.event.set_grab(True)
+        pg.mouse.set_visible(False)
+        self.game.change_scene(self.game.maze_scene)
+
+    def _respawn_player(self):
+        if self.game.player.soft_landing:
+            r, c = self.game.current_battle_pos
+            grid = self.game.grid
+            rows, cols = grid.shape
+            for dist in [5, 4, 3, 2, 1]:
+                nr = max(0, min(rows - 1, r + dist))
+                nc = max(0, min(cols - 1, c))
+                if grid[nr, nc] == 0:
+                    self.game.player.pos[0] = float(nc)
+                    self.game.player.pos[1] = float(nr)
+                    return
+        self.game.player.pos[0] = 2.0
+        self.game.player.pos[1] = 2.0
+        
+    def handle_event(self, event):
+        self.battle.handle_event(event)
+        self.quit_button.handle_event(event) 
+        
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_q:
+                self.surrender()
+    
+    def update(self):
+        self.battle.update()
+        if self.battle.check_game_over(self.game.player):
+            if self.resolved :
+                return
+            self.resolved = True
+            
+            if self.battle.chess_engine.is_checkmate() and not self.battle.chess_engine.white_turn:
+                if self.battle.dragon_level == constants.BOSS_DRAG_LEVEL:
+                    print("YOU WIN!!!")
+                    pg.event.set_grab(False)
+                    pg.mouse.set_visible(True)
+                    self.game.change_scene(EndScreen(self.game, victory=True))
+                    return
+
+                r, c = self.game.current_battle_pos                
+                self.game.grid[r, c] = 0
+                print("One Battle cleared!")
+            
+            elif self.game.player.lives <= 0:
+                print("Game Over")
+                pg.event.set_grab(False)
+                pg.mouse.set_visible(True)
+                self.game.change_scene(EndScreen(self.game, victory=False))
+                return
+            else:
+                print("Stalemate - respawing)")
+                self._respawn_player()
+            self.game.player.playing_chess = False
+            self.game.player.speed = 0.1
+            self.game.player.can_move = True
+
+            pg.event.set_grab(True)
+            pg.mouse.set_visible(False)
+            
+            self.game.change_scene(self.game.maze_scene)
+            pg.time.wait(1)
+            
+    def render(self):
+        game = self.game
+        
+        game.graphic3d.ctx.clear(0.05, 0.05, 0.1)
+        game.graphic2d_surf.fill((0,0,0,0))
+        game.graphic2d.draw_chess_board(
+            self.battle.chess_engine,
+            selected_sq=self.battle.selected_sq,
+            hover_sq=self.battle.hover_sq,
+            valid_moves= self.battle.hover_moves)
+        game.graphic2d.draw_fps(self.battle.ai_thinking, True)
+        self.quit_button.draw()
+        game.graphic3d.render_2d_surf(game.graphic2d_surf)
+
+    def resize(self, width, height):
+        self.quit_button.surface = self.game.graphic2d_surf
+        self.quit_button.rect.x = width - 190
+        self.quit_button.rect.y = height - 60
+        self.battle.surface = self.game.graphic2d_surf
+
+============================================================
+SOURCE FILE: chess_engine.py
+============================================================
+
+import pygame as pg
+import numpy as np
+import os
+from numba import njit
+import constants
+from piece_points import piece_square_mid_game, piece_square_end_game, PHASE_WEIGHTS
+ 
+# ============ PIECE TYPES =================
+w_p, w_k, w_b, w_r, w_q, w_K = 1, 2, 3, 4, 5, 6
+b_p, b_k, b_b, b_r, b_q, b_K = 9, 10, 11, 12, 13, 14
+empty = 0
+ 
+# ============ OFFSETS =================
+knight_offsets = np.array([-17, -15, -10, -6, 6, 10, 15, 17], dtype=np.int32)
+diag_offsets = np.array([-9, -7, 7, 9], dtype=np.int32)
+straight_offsets = np.array([-8, -1, 1, 8], dtype=np.int32)
+king_offsets = np.array([-9, -8, -7, -1, 1, 7, 8, 9], dtype=np.int32)
+berserker_king_offsets = np.array([-17, -15, -10, -6, 6, 10, 15, 17, -9,  -8,  -7, -1, 1,  7,  8,  9],
+    dtype=np.int32)
+
+@njit
+def mop_up_eval(my_king_sq, enemy_king_sq, phase):
+    if phase > 6:
+        return 0
+    
+    score = 0
+
+    ek_r, ek_c = enemy_king_sq // 8, enemy_king_sq % 8
+    dist_r = max(3 - ek_r, ek_r - 4)
+    dist_c = max(3 - ek_c, ek_c - 4)
+    score += (dist_r + dist_c) * 10 
+
+    mk_r, mk_c = my_king_sq // 8, my_king_sq % 8
+    dist_between = abs(mk_r - ek_r) + abs(mk_c - ek_c)
+    score += (14 - dist_between) * 5
+
+    return score
+ 
+class Chess:
+    def __init__(self, super_mode: int=0, load_graphic: bool=True):
+        pawn_row = np.array([w_p] * 8)
+        if super_mode > 0:
+            cnt = min(super_mode, 8)
+            idxs = np.random.choice(len(pawn_row), cnt, replace=False)
+            pawn_row[idxs] = w_q
+        
+        self.board = np.zeros(64, dtype=np.int8)
+        self.board[0: 8]   = [b_r, b_k, b_b, b_q, b_K, b_b, b_k, b_r]
+        self.board[8: 16]  = [b_p, b_p, b_p, b_p, b_p, b_p, b_p, b_p]
+        self.board[48: 56] = pawn_row
+        self.board[56: 64] = [w_r, w_k, w_b, w_q, w_K, w_b, w_k, w_r]
+ 
+        self.white_turn = True
+        self.move_log   = []
+        self.board_history = []
+        self.org_imgs   = {}
+        self.images     = {}
+        if load_graphic:
+            self.load_images()
+        
+        self.phase = 0
+        self.mid_game_score = 0
+        self.end_game_score = 0
+        self.calc_board_score()
+        self.max_phase = max(24, self.phase)
+        self.white_king_sq, self.black_king_sq = 60, 4
+        self.board_history.append(self.board.tobytes())
+
+        self.berserker_king = False
+        self.dragons_blunder = False
+        self.ai_fatigue = False
+        self.move_count = 0
+ 
+    def calc_board_score(self):
+        for sq in range(64):
+                piece = self.board[sq]
+                if piece != 0:
+                    self.mid_game_score += piece_square_mid_game[piece][sq]
+                    self.end_game_score += piece_square_end_game[piece][sq]
+                    self.phase += PHASE_WEIGHTS[piece]
+    
+    def eval_board(self):
+        phase = min(max(self.phase, 0), self.max_phase)
+        base_score = (self.mid_game_score * phase + self.end_game_score * (self.max_phase - phase)) // self.max_phase
+        
+        if base_score > 0:
+            base_score += mop_up_eval(self.white_king_sq, self.black_king_sq, phase)
+        elif base_score < 0:
+            base_score -= mop_up_eval(self.black_king_sq, self.white_king_sq, phase)
+            
+        return base_score
+ 
+    def load_images(self):
+        try:
+            base_path = os.path.dirname(__file__)
+            image_folder = os.path.join(base_path, "images")
+            
+            pieces = ['pawn', 'knight', 'bishop', 'rook', 'queen', 'king']
+            colors = ['white', 'black']
+            for c in colors:
+                for p in pieces:
+                    key = f"{c}_{p}"
+                    full_path = os.path.join(image_folder, f"{key}.png")
+                    img = pg.image.load(full_path).convert_alpha()
+                    self.org_imgs[key] = img
+        except Exception as e:
+            print(f"ERROR: {e}")
+            print("Piece files not found, shifting to text if possible.")
+ 
+    def make_move(self, move):
+        start, end, flag = decode_move(move)
+        piece = self.board[start]
+        captured_piece = self.board[end]
+ 
+        self.move_log.append((move, captured_piece, self.white_king_sq, self.black_king_sq,
+                              self.white_turn, self.phase, self.mid_game_score, self.end_game_score))
+        self.mid_game_score -= piece_square_mid_game[piece][start]
+        self.end_game_score -= piece_square_end_game[piece][end]
+        
+        if (piece & 7) == 6:
+            if piece & 8:
+                self.black_king_sq = end
+            else:
+                self.white_king_sq = end
+        
+        if captured_piece != 0:
+            self.mid_game_score -= piece_square_mid_game[captured_piece][end]
+            self.end_game_score -= piece_square_end_game[captured_piece][end]
+            self.phase -= PHASE_WEIGHTS[captured_piece]
+        
+        if flag == 1: 
+            promote_queen_val = 13 if (piece & 8) else 5
+            self.board[end] = promote_queen_val
+            self.mid_game_score += piece_square_mid_game[promote_queen_val][end]
+            self.end_game_score += piece_square_end_game[promote_queen_val][end]
+            self.phase += PHASE_WEIGHTS[promote_queen_val]
+        else:
+            self.board[end] = piece
+            self.mid_game_score += piece_square_mid_game[piece][end]
+            self.end_game_score += piece_square_end_game[piece][end]
+        
+        self.board[start] = 0
+        self.white_turn = not self.white_turn
+        self.board_history.append(self.board.tobytes())
+ 
+    def undo_move(self):
+        if not self.move_log:
+            return
+        move, captured_piece,  prev_w_K, prev_b_K, prev_turn, prev_phase, prev_mid_game, prev_end_game = self.move_log.pop()
+        self.mid_game_score, self.end_game_score = prev_mid_game, prev_end_game
+        self.phase = prev_phase
+        self.white_turn = prev_turn
+        self.white_king_sq = prev_w_K
+        self.black_king_sq = prev_b_K
+        
+        start, end, flag = decode_move(move)
+        curr_piece = self.board[end]
+ 
+        if flag == 1:
+            pawn_val = 9 if (curr_piece & 8) else 1
+            self.board[start] = pawn_val
+        else:
+            self.board[start] = curr_piece
+        
+        self.board[end] = captured_piece
+        if self.board_history:
+            self.board_history.pop()
+    
+    def get_valid_moves(self):
+        return self.validate_moves(self.get_all_pos_moves())  # validates pseudo-valid moves
+ 
+    def get_all_pos_moves(self):
+        berserker_king: bool = bool(self.berserker_king and self.white_turn and (self.phase <= 12))
+        return get_pos_moves(self.white_turn, self.board, berserker_king)
+ 
+    def validate_moves(self, pseudo_moves):
+        valid_moves=[]
+        for move in pseudo_moves:
+            self.make_move(move)
+            if not self.is_in_check(not self.white_turn):
+                valid_moves.append(move)
+            self.undo_move()
+        return valid_moves
+ 
+    def is_in_check(self, is_white_king):
+        king_sq= self.white_king_sq if is_white_king else self.black_king_sq
+        attacker_is_white = not is_white_king
+        berserker_king = bool(self.berserker_king and attacker_is_white and (self.phase <= 12))
+        return is_square_attacked(self.board, king_sq, attacker_is_white, berserker_king)
+    
+    def is_checkmate(self):
+        if self.is_in_check(self.white_turn):
+            if len(self.get_valid_moves()) == 0:
+                return True
+        return False
+    
+    def is_stalemate(self):
+        curr_board = self.board.tobytes()
+        if self.board_history.count(curr_board) >= 3:
+            return True
+        if not self.is_in_check(self.white_turn):
+            if len(self.get_valid_moves()) == 0:
+                return True
+        return False
+    
+    def clone(self):
+        c = Chess(super_mode=0, load_graphic=False)
+        c.board = self.board.copy()
+        c.white_turn = self.white_turn
+        c.white_king_sq = self.white_king_sq
+        c.black_king_sq = self.black_king_sq
+        c.mid_game_score = self.mid_game_score
+        c.end_game_score = self.end_game_score
+        c.phase = self.phase
+        c.max_phase = self.max_phase
+        c.move_log = list(self.move_log)
+        c.board_history = list(self.board_history)
+        # skill flags
+        c.dragons_blunder = self.dragons_blunder
+        c.ai_fatigue = self.ai_fatigue
+        c.move_count = self.move_count
+        c.berserker_king = False  # AI never gets this
+        return c
+
+@njit
+def get_pos_moves(white_turn, board, berseker_king=False):
+    moves = np.zeros(256, dtype=np.int32)
+    cnt = 0
+    for sq in range(64):
+            piece = board[sq]
+            if piece == 0: continue
+ 
+            piece_is_black = bool(piece & 8)
+            if white_turn and piece_is_black: continue
+            if not white_turn and not piece_is_black: continue
+ 
+            color = -1 if not piece_is_black else 1
+            piece_type = piece & 7
+ 
+            if piece_type == 1:
+                cnt = pawn_moves(board, sq, color, moves, cnt)
+            elif piece_type == 2:
+                cnt = knight_moves(board, sq, moves, cnt)
+            elif piece_type == 3:
+                cnt = bishop_moves(board, sq, moves, cnt)
+            elif piece_type == 4:
+                cnt = rook_moves(board, sq, moves, cnt)
+            elif piece_type == 5:
+                cnt = queen_moves(board, sq, moves, cnt)
+            elif piece_type == 6:
+                use_berserker_king = berseker_king and not piece_is_black
+                cnt = king_moves(board, sq, moves, cnt, use_berserker_king)
+ 
+    return moves[:cnt]
+
+@njit
+def pawn_moves(board, sq, color, moves, cnt):
+    is_black = (color == 1)
+    dir_offset = 8 if is_black else -8
+    start_row = 1 if is_black else 6
+    promote_row = 7 if is_black else 0
+    
+    target = sq + dir_offset
+    if 0 <= target < 64 and board[target] == 0:
+        if target // 8 == promote_row:
+            moves[cnt] = sq | (target << 6) | (1 << 12)
+        else:
+            moves[cnt] = sq | (target << 6)
+        cnt  +=1
+ 
+        if sq // 8 == start_row:
+            target_2_ahead = sq + (2 * dir_offset)
+            if board[target_2_ahead] == 0:
+                moves[cnt] = sq | (target_2_ahead << 6)
+                cnt += 1
+        
+    for diag_offset in (dir_offset - 1, dir_offset + 1):
+        target = sq + diag_offset
+        if 0 <= target < 64 and abs((sq % 8) - (target % 8)) == 1:
+                target_piece = board[target]
+                if target_piece != 0:
+                    if ((board[sq] & 8) != (target_piece & 8)): 
+                        if target // 8 == promote_row:
+                            moves[cnt] = sq | (target << 6) | (1 << 12)
+                        else:
+                            moves[cnt] = sq | (target << 6)
+                        cnt += 1
+    return cnt 
+ 
+@njit
+def knight_moves(board, sq, moves, cnt):
+    for jump in knight_offsets:
+        target_sq = sq + jump
+        if 0 <= target_sq < 64:
+            if abs((sq % 8) - (target_sq % 8)) <= 2: 
+                target_piece = board[target_sq]
+                if target_piece == 0 or ((board[sq] & 8) != (target_piece & 8)):
+                    moves[cnt] = sq | (target_sq << 6)
+                    cnt += 1
+    return cnt
+ 
+@njit
+def bishop_moves(board, sq, moves, cnt):
+    return sliding_piece_move_finder(board, sq, diag_offsets, moves, cnt)
+@njit
+def rook_moves(board, sq, moves, cnt):
+    return sliding_piece_move_finder(board, sq, straight_offsets, moves, cnt)
+@njit
+def queen_moves(board, sq, moves, cnt):
+    cnt = sliding_piece_move_finder(board, sq, diag_offsets, moves, cnt)
+    cnt = sliding_piece_move_finder(board, sq, straight_offsets, moves, cnt)
+    return cnt
+@njit
+def king_moves(board, sq, moves, cnt, use_berserker_king=False):
+    offsets = berserker_king_offsets if use_berserker_king else king_offsets
+    col_limit = 2 if use_berserker_king else 1
+    for jump in offsets: 
+        target = sq + jump
+        if 0 <= target < 64:
+            if abs((sq % 8) - (target % 8)) <= col_limit:
+                target_piece = board[target]
+                if target_piece == 0 or (board[sq] & 8) != (target_piece & 8):
+                    moves[cnt] = sq | (target << 6)
+                    cnt += 1
+    return cnt
+ 
+@njit
+def sliding_piece_move_finder(board, sq, offsets, moves, cnt):
+    for jump in offsets:
+        target = sq
+        for _ in range(1, 8):
+            col = target % 8
+            target += jump
+ 
+            if target < 0 or target >= 64: break
+            if abs(col - (target % 8)) > 1: break
+ 
+            target_piece = board[target]
+            if target_piece == 0:
+                moves[cnt] = sq | (target << 6)
+                cnt += 1
+            else:
+                if (board[sq] & 8) != (target_piece & 8):
+                    moves[cnt] = sq | (target << 6)
+                    cnt += 1
+                break
+    return cnt
+ 
+@njit
+def is_square_attacked(board, sq, attacker_is_white, berserker_king: bool=False):
+    attacker_color_bit = 0 if attacker_is_white else 8
+ 
+    pawn_dir = 8 if attacker_is_white else -8
+    for shift in (pawn_dir -1, pawn_dir+1):
+        target = sq + shift
+        if 0 <= target < 64 and abs((sq % 8) - (target % 8)) == 1:
+            if board[target] == (1 | attacker_color_bit):
+                return True
+    
+    knight_val = 2 | attacker_color_bit
+    for jump in knight_offsets:
+        target = sq + jump
+        if 0 <= target < 64 and abs((sq % 8) - (target % 8)) <= 2:
+            if board[target] == knight_val: return True
+    
+    king_val = 6 | attacker_color_bit
+    for jump in king_offsets:
+        target = sq + jump
+        if 0 <= target < 64 and abs((sq % 8) - (target % 8)) <= 1:
+            if board[target] == king_val: return True
+    
+    if berserker_king:
+        for jump in knight_offsets:
+            target = sq + jump
+            if 0<=target<64 and abs((sq % 8) - (target % 8)) <= 2:
+                if board[target] == king_val:
+                    return True
+
+    bishop_val = 3 | attacker_color_bit
+    rook_val = 4 | attacker_color_bit
+    queen_val = 5 | attacker_color_bit
+ 
+    for jump in diag_offsets:
+        target = sq
+        for _ in range(1, 8):
+            col = target % 8
+            target += jump
+            if target < 0 or target >= 64 or abs(col - (target % 8)) > 1: break
+            target_val = board[target]
+            if target_val != 0:
+                if target_val == bishop_val or target_val == queen_val:
+                    return True
+                break
+    
+    for jump in straight_offsets:
+        target = sq
+        for _ in range(1, 8):
+            col = target % 8
+            target += jump
+            if target < 0 or target >= 64 or abs(col - (target % 8)) > 1: break
+            target_val = board[target]
+            if target_val != 0:
+                if target_val == rook_val or target_val == queen_val:
+                    return True
+                break
+    return False
+             
+@njit
+def score_move(move, board):
+    m = move
+    start = m & 63
+    end = (m >> 6) & 63
+    flag = m >> 12
+
+    score = np.int32(0)
+    captured_piece = np.int32(board[end])
+    moving_piece   = np.int32(board[start])
+
+    if captured_piece != 0:
+        victim_val   = (captured_piece & 7) * 100
+        attacker_val = (moving_piece   & 7) * 10
+        score += np.int32(1000 + (victim_val - attacker_val))
+        
+    if flag == 1:
+        score += np.int32(900)
+    return score
+ 
+@njit
+def sort_moves(moves, board):
+    # Optimized Insertion Sort
+    n = len(moves)
+    scores = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        scores[i] = score_move(moves[i], board)
+    
+    for i in range(1, n):
+        curr_score = scores[i]
+        curr_move = moves[i]
+        j = i - 1
+
+        while j >= 0 and scores[j] < curr_score:
+            scores[j + 1] = scores[j]
+            moves[ j + 1] = moves[j]
+            j -= 1
+        
+        scores[j + 1] = curr_score
+        moves[j + 1] = curr_move
+    return moves
+
+@njit
+def encode_move(start, end, flag):
+    return start | (end << 6) | (flag << 12)
+ 
+@njit
+def decode_move(move):
+    start = move & 63
+    end = (move >> 6) & 63
+    flag = move >> 12
+    return start, end, flag
+
+============================================================
+SOURCE FILE: constants.py
+============================================================
+
+HEIGHT, WIDTH = 800, 1000
+ROWS, COLS = 8, 8
+SQSIZE = HEIGHT / ROWS
+color = {
+    'light': '#EAFBC8',
+    'dark': '#779A58'
+}
+colors = {
+    'light_tile': '#EAFBC8', 
+    'dark_tile':  '#779A58',  
+    'wall':        '#1E1E1E',  
+    'room':        '#FFFFFF', 
+    'start':       '#4CAF50', 
+    'battle':      '#E53935',  
+    'boss_start':  '#6A1B9A',  
+}
+
+BOSS_DRAG_LEVEL = 2
+MINION_DRAG_LEVEL = 1
+MAX_BOSS_DEPTH = 6
+MAX_MINION_DEPTH = 1
+
+============================================================
+SOURCE FILE: dragon.py
+============================================================
+
+from chess_engine import sort_moves
+import numpy as np
+import constants
+import time, random
+from numba import njit
+from piece_points import *
+from chess_engine import Chess
+
+class Dragon:
+    def __init__(self, name, dragon_level, drag_time_limit=0):
+        self.name = name
+        self.dragon_level = dragon_level
+        self.time_limit_bonus = drag_time_limit
+        self.nodes_visited = 0
+    
+    def get_move(self, game: Chess, drag_level):
+        # Endgame Overdrive Check
+        is_endgame = game.phase < 6
+        
+        if drag_level == constants.BOSS_DRAG_LEVEL:
+            max_depth = constants.MAX_BOSS_DEPTH + (3 if is_endgame else 0)
+        elif drag_level == constants.MINION_DRAG_LEVEL:
+            max_depth = constants.MAX_MINION_DEPTH + (2 if is_endgame else 0)
+        else:
+            max_depth = 1
+        if game.ai_fatigue:
+            fatigue_reduction = (game.move_count // 10) * 2
+            max_depth = max(1, max_depth - fatigue_reduction)           
+        valid_moves = game.get_valid_moves()
+        if not valid_moves: return None
+        
+        if self.dragon_level == 0:
+            return random.choice(valid_moves)
+        
+        start_time = time.time()
+        time_limit = 3.0 + self.time_limit_bonus + (3.0 if is_endgame else 0.0)
+        self.nodes_visited = 0
+
+        best_move_so_far = valid_moves[0]
+        for depth in range(1, max_depth+1):
+            curr_time = time.time()
+            if curr_time - start_time >= time_limit:
+                break
+            move = self.find_best_move_v2(game, valid_moves, depth, start_time, time_limit)
+            if move is not None:
+                best_move_so_far = move
+            else:
+                break
+        return best_move_so_far
+
+    def find_best_move_v2(self, game: Chess, valid_moves, depth, start_time, time_limit):
+        """this function analyzes the score to help select the best possible move using a minimax algorithm"""
+        # Prevent Infinite Shuffle by tracking tied moves
+        best_moves_list = []
+        infinity   =  float('inf')
+        best_score = -infinity
+        alpha      = -infinity
+        beta       =  infinity
+        turn_multiplier = 1 if game.white_turn else -1
+
+        ordered_moves = sort_moves(valid_moves, game.board)
+
+        for move in ordered_moves:
+            if (time.time() - start_time) >= time_limit:
+                return None
+            
+            game.make_move(move)
+            score = self.minimax_v2(game, depth-1, -beta, -alpha, -turn_multiplier, start_time, time_limit)
+            game.undo_move()
+
+            if score is None: return None
+            score = -score
+
+            if score > best_score:
+                best_score = score
+                best_moves_list = [move]
+            elif score == best_score:
+                best_moves_list.append(move)
+            
+            alpha = max(alpha, score)
+            if alpha >= beta:
+                break
+
+        if game.dragons_blunder and len(ordered_moves) >= 3:
+            if random.random() < 0.75:
+                return ordered_moves[2]
+            
+        return random.choice(best_moves_list) if best_moves_list else ordered_moves[0]
+
+    def minimax_v2(self, game: Chess, depth, alpha, beta, turn_multiplier, start_time, time_limit):
+        self.nodes_visited += 1
+
+        if time.time() - start_time >= time_limit: return None
+
+        if depth == 0:
+            return turn_multiplier * game.eval_board()
+        
+        valid_moves = game.get_valid_moves()
+
+        if len(valid_moves) == 0:
+            if game.is_in_check(game.white_turn):
+                # Weighting Checkmate for Faster Mates
+                return -200000 + (100 * depth)
+            else:
+                return 0
+        
+        ordered_moves = sort_moves(valid_moves, game.board)
+        max_eval = float('-inf')
+
+        for move in ordered_moves:
+            game.make_move(move)
+            board_eval = self.minimax_v2(game, depth - 1, -beta, -alpha, -turn_multiplier, start_time, time_limit)
+            game.undo_move()
+
+            if board_eval is None: return None
+
+            evaluation = -board_eval
+            max_eval = max(max_eval, evaluation)
+            alpha = max(alpha, evaluation)
+
+            if alpha >= beta: break
+        
+        return max_eval
+
+============================================================
+SOURCE FILE: game.py
+============================================================
+
+import pygame as pg
+from pathlib import Path
+import constants
+from player import Player
+from graphics import Graphics2d, Graphics3d
+from map_gen import MapGen
+
+base_path = Path(__file__).resolve().parent
+
+class Game:
+    def __init__(self):
+        pg.init()
+        self.is_fullscreen = False
+        self.screen = pg.display.set_mode((constants.WIDTH, constants.HEIGHT), pg.OPENGL | pg.DOUBLEBUF | pg.RESIZABLE)
+
+        self.clock = pg.time.Clock()
+        icon_path = base_path / 'images' / 'white_queen.png'
+        try:
+            game_icon = pg.image.load(icon_path) 
+            pg.display.set_icon(game_icon)
+        except FileNotFoundError:
+            print("Icon file not found.")
+        pg.display.set_caption("Dragon Chess Maze")
+
+        self.player = Player(start_pos=(2, 2))
+        self.graphic3d = Graphics3d(self.screen)
+        self.graphic2d_surf = pg.Surface((constants.WIDTH, constants.HEIGHT), pg.SRCALPHA).convert_alpha()
+        self.graphic2d = Graphics2d(self.graphic2d_surf, self.player)
+
+        self.map_gen = MapGen(numBattles=81, maze_size=(45,45)) 
+        self.grid, self.portals = self.map_gen.generate_full()
+
+        self.current_battle_pos = (0,0)
+        self.current_scene = None
+        self.running = True
+        self.wall_color = (0.3, 0.3, 0.3)
+        self.portal_color = (0.6, 0.6, 0.6)
+        self.maze_scene = None
+        self.player.time_limit_of_AI = 0
+        self.retry = False    
+    
+    def change_scene(self, new_scene):
+        self.current_scene = new_scene
+    
+    def run(self):
+        self.running = True
+        while self.running:
+            self.delta_time = self.clock.tick(60) / 1000.0
+
+            for event in pg.event.get():
+                if event.type == pg.QUIT:
+                    self.running = False
+                # Resizing Fix
+                if event.type == pg.VIDEORESIZE:
+                    width, height = event.size
+                    self.graphic3d.ctx.viewport = (0, 0, width, height)
+                    self.graphic3d.update_projection(width=width, height=height)
+                    self.graphic2d_surf = pg.Surface((width, height), pg.SRCALPHA).convert_alpha()
+                    self.graphic2d.surface = self.graphic2d_surf
+                    if hasattr(self.current_scene, 'resize'):
+                        self.current_scene.resize(width, height) 
+                if self.current_scene:
+                    self.current_scene.handle_event(event)
+            
+            if self.current_scene:
+                self.current_scene.update()
+                self.current_scene.render()
+            
+            pg.display.flip()
+            if self.retry:
+                return True
+        return False
+
+============================================================
+SOURCE FILE: graphics.py
+============================================================
+
+import moderngl as mgl
+import numpy as np, math
+import pygame as pg
+from pyrr import matrix44
+from shaders.shaders_3D import VERTEX_SHADER_3D, FRAGMENT_SHADER_3D
+from shaders.shaders_2D import VERTEX_SHADER_2D, FRAGMENT_SHADER_2D
+import constants
+from player import Player
+from pathlib import Path
+import os
+
+class Graphics3d:
+    def __init__(self, screen):
+        self.ctx = mgl.create_context()
+        self.ctx.enable(mgl.DEPTH_TEST)
+        self.ctx.disable(mgl.CULL_FACE)
+        self.ctx.enable(mgl.BLEND)
+
+        self.prog = self.ctx.program(
+            vertex_shader=VERTEX_SHADER_3D,
+            fragment_shader=FRAGMENT_SHADER_3D
+        )
+
+        self.vbo = self.ctx.buffer(self._cube_data())
+        self.elongated_vbo = self.ctx.buffer(self._elongated_cube_data())
+
+        self.vao = self.ctx.simple_vertex_array(self.prog, self.vbo, "in_pos")
+        self.elongated_vao = self.ctx.simple_vertex_array(self.prog, self.elongated_vbo, 'in_pos')
+
+        aspect_ratio_screen = screen.get_width() / screen.get_height()
+        self.projection = matrix44.create_perspective_projection_matrix(90.0, aspect_ratio_screen, 0.1, 100.0)
+        self.prog["m_proj"].write(self.projection.astype("float32")) # type: ignore
+
+        self.vertex_shader_2d = VERTEX_SHADER_2D
+        self.frag_shader_2d = FRAGMENT_SHADER_2D
+        self.prog_2d = self.ctx.program(
+            vertex_shader=self.vertex_shader_2d,
+            fragment_shader=self.frag_shader_2d
+        )
+        self.prog_2d['u_texture'].value = 0 # type: ignore
+        self.quad_buffer = self.ctx.buffer(np.array([
+           -1,  1,    0, 0,
+           -1, -1,    0, 1,
+            1,  1,    1, 0,
+            1, -1,    1, 1,
+        ], dtype='float32'))
+
+        self.vao_2d = self.ctx.simple_vertex_array(
+            self.prog_2d,
+            self.quad_buffer,
+            "in_pos",
+            "in_texcoord"
+        )
+
+    def _cube_data(self):
+        vertices = np.array([
+            -0.5, -0.5, -0.5,  0.5, -0.5, -0.5,  0.5,  0.5, -0.5,
+             0.5,  0.5, -0.5, -0.5,  0.5, -0.5, -0.5, -0.5, -0.5,
+            -0.5, -0.5,  0.5,  0.5, -0.5,  0.5,  0.5,  0.5,  0.5,
+             0.5,  0.5,  0.5, -0.5,  0.5,  0.5, -0.5, -0.5,  0.5,
+            -0.5,  0.5,  0.5, -0.5,  0.5, -0.5, -0.5, -0.5, -0.5,
+            -0.5, -0.5, -0.5, -0.5, -0.5,  0.5, -0.5,  0.5,  0.5,
+             0.5,  0.5,  0.5,  0.5,  0.5, -0.5,  0.5, -0.5, -0.5,
+             0.5, -0.5, -0.5,  0.5, -0.5,  0.5,  0.5,  0.5,  0.5,
+            -0.5, -0.5, -0.5,  0.5, -0.5, -0.5,  0.5, -0.5,  0.5,
+             0.5, -0.5,  0.5, -0.5, -0.5,  0.5, -0.5, -0.5, -0.5,
+            -0.5,  0.5, -0.5,  0.5,  0.5, -0.5,  0.5,  0.5,  0.5,
+             0.5,  0.5,  0.5, -0.5,  0.5,  0.5, -0.5,  0.5, -0.5,
+        ], dtype="float32")
+        return vertices
+    
+    def _elongated_cube_data(self):
+        vertices = np.array([
+            -0.5, -0.5, -0.5,  0.5, -0.5, -0.5,  0.5,  1.5, -0.5,
+             0.5,  1.5, -0.5, -0.5,  1.5, -0.5, -0.5, -0.5, -0.5,
+            -0.5, -0.5,  0.5,  0.5, -0.5,  0.5,  0.5,  1.5,  0.5,
+             0.5,  1.5,  0.5, -0.5,  1.5,  0.5, -0.5, -0.5,  0.5,
+            -0.5,  1.5,  0.5, -0.5,  1.5, -0.5, -0.5, -0.5, -0.5,
+            -0.5, -0.5, -0.5, -0.5, -0.5,  0.5, -0.5,  1.5,  0.5,
+             0.5,  1.5,  0.5,  0.5,  1.5, -0.5,  0.5, -0.5, -0.5,
+             0.5, -0.5, -0.5,  0.5, -0.5,  0.5,  0.5,  1.5,  0.5,
+            -0.5, -0.5, -0.5,  0.5, -0.5, -0.5,  0.5, -0.5,  0.5,
+             0.5, -0.5,  0.5, -0.5, -0.5,  0.5, -0.5, -0.5, -0.5,
+            -0.5,  1.5, -0.5,  0.5,  1.5, -0.5,  0.5,  1.5,  0.5,
+             0.5,  1.5,  0.5, -0.5,  1.5,  0.5, -0.5,  1.5, -0.5,
+        ], dtype="float32")
+        return vertices
+
+    def update_view(self, player):
+        cam = np.array([player.pos[0], 0.5, player.pos[1]], dtype="float32")
+        dir_cam = np.array([np.cos(player.angle_x), 0.0, np.sin(player.angle_x)], dtype="float32")
+        up_vec = np.array([0.0, 1.0, 0.0], dtype="float32")
+        view = matrix44.create_look_at(cam, cam + dir_cam, up_vec)
+        self.prog["m_view"].write(view.astype("float32")) # type: ignore
+
+    def update_projection(self, width, height):
+        aspect_ratio = width / height
+        self.projection = matrix44.create_perspective_projection_matrix(90.0, aspect_ratio, 0.1, 100.0)
+        self.prog['m_proj'].write(self.projection.astype('float32')) # type: ignore
+
+    def render_maze(self, grid, wall_color, portal_color, player: Player):
+        """This function renders the maze with a distance based rendering which provides a fog look. It only loads
+        a certian radius around a player, and fades the wall color darker and darker as it reaches the falloff."""
+        self.ctx.clear(0.1, 0.1, 0.1)
+        self.ctx.enable(mgl.DEPTH_TEST)
+        self.ctx.disable(mgl.CULL_FACE)
+        self.prog["m_proj"].write(self.projection.astype("float32")) # type: ignore
+        clarity =  player.clarity
+        portal_on = player.portal_tower
+
+        max_dist = 15.0 if clarity else 12.0
+
+
+        rows, cols = grid.shape
+        for r in range(rows):
+            for c in range(cols):
+                val = grid[r, c]
+                if val == 0: continue 
+                if val == 2: continue
+
+                dx = player.pos[0] - (c + 0.5)
+                dz = player.pos[1] - (r + 0.5)
+                dist = math.hypot(dx, dz)
+                
+                portal_enlarge = (portal_on and val == 3 and dist < 10.0)
+
+
+                if dist >= max_dist and not portal_enlarge: continue
+
+                translation_vec = np.array([c + 0.5, 0.5, r + 0.5], dtype="float32")
+                model = matrix44.create_from_translation(translation_vec)
+                self.prog["m_model"].write(model.astype("float32")) # type: ignore
+
+                dimer = max(0.0, 1.0 - (dist / max_dist)) ** 1.5
+
+                if val == 1:                    
+                    r_c, g_c, b_c= wall_color
+                elif val == 3:
+                    r_c, g_c, b_c= portal_color
+                elif val == 4:
+                    r_c, g_c, b_c= 1.0, 0.0, 0.0
+                else:
+                    r_c, g_c, b_c = 0.5, 0.5, 0.5
+                color = (r_c * dimer, g_c * dimer, b_c * dimer)
+                self.prog["u_color"].value = color # type: ignore
+                if (val == 3 or val == 4) and portal_enlarge:
+                    self.elongated_vao.render(mgl.TRIANGLES)
+                else:
+                    self.vao.render(mgl.TRIANGLES)
+
+    def render_2d_surf(self, surface):
+        rgba = pg.image.tobytes(surface, 'RGBA', False)
+        texture = self.ctx.texture(surface.get_size(), 4, data=rgba)
+
+        self.ctx.enable(mgl.BLEND)
+        self.ctx.disable(mgl.DEPTH_TEST)
+        self.ctx.blend_func = mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA
+
+        texture.use(0)
+        self.vao_2d.render(mgl.TRIANGLE_STRIP)
+
+        self.ctx.disable(mgl.BLEND)
+        self.ctx.enable(mgl.DEPTH_TEST)
+        texture.release()
+
+class Graphics2d:
+    def __init__(self, surface, player, txt_size=36, big_txt_size=72):
+        self.surface = surface
+        self.font = pg.font.Font(None, txt_size)
+        self.large_font = pg.font.Font(None, big_txt_size)
+        self.player = player
+        self.images = {}
+        self.load_dragon_imgs()
+        self.minimap_radius = 90
+        self.wp_font = pg.font.Font(None, 17)
+
+    def load_dragon_imgs(self):
+        _, height = self.surface.get_size()
+        sqsize = height // 8
+        try:
+            for drag in ['dragon_normal.png', 'dragon_thinking.png']:
+                base_path = os.path.dirname(__file__)
+                image_folder = os.path.join(base_path, "images")
+                full_path = os.path.join(image_folder, f"{drag}")
+                img = pg.image.load(full_path).convert()
+                img.set_colorkey((255, 0, 255))
+                img = pg.transform.smoothscale(img, (sqsize*2, sqsize*2))
+                self.images[drag] = img
+        except:
+            print("Dragon images file not found, shifting to writing")
+
+    def draw_chess_board(self, chess_engine, selected_sq=None,
+                         hover_sq=None, valid_moves=None):
+        width, height = self.surface.get_size()
+        sqsize = min(width-200, height) // 8
+        x_offset = ((width - 200) - (sqsize * 8)) // 2
+        y_offset = (height - (sqsize * 8)) // 2
+
+        if chess_engine is None or chess_engine.board is None:
+            return
+        
+        board = chess_engine.board
+        for sq in range(64):
+            
+            r, c = sq // 8, sq % 8
+            sq_color = constants.color["light"] if (r + c) % 2 == 0 else constants.color["dark"]
+            pg.draw.rect(self.surface, sq_color,
+                (x_offset + (c * sqsize), y_offset + (r * sqsize), sqsize, sqsize))
+            
+            if hover_sq == sq:
+                surf = pg.Surface((sqsize, sqsize))
+                surf.set_alpha(100)
+                surf.fill((100, 200, 255))
+                self.surface.blit(surf, (x_offset + c*sqsize, y_offset + r*sqsize))
+
+            if selected_sq == sq:
+                surf = pg.Surface((sqsize, sqsize))
+                surf.set_alpha(100)
+                surf.fill((255, 255, 0))
+                self.surface.blit(surf, (x_offset + c*sqsize, y_offset + r*sqsize))
+            
+            if valid_moves and sq in valid_moves:
+                center = (x_offset + c*sqsize + sqsize//2, 
+                                                    y_offset + r*sqsize + sqsize//2)
+                targ_piece = board[sq]
+                rect = pg.Rect(center[0] - sqsize//2, center[1]-sqsize//2, sqsize, sqsize)
+                if targ_piece == 0:
+                    pg.draw.rect(self.surface, (100, 100, 100), rect, 5)
+                else:
+                    pg.draw.rect(self.surface, (200, 50, 50), rect, 5)
+
+            piece = chess_engine.board[sq]
+            if piece != 0:
+                piece_type_val = piece & 7
+                type_names = (None, 'pawn', 'knight', 'bishop', 'rook', 'queen', 'king')
+                type_piece = type_names[piece_type_val]
+                p_color = 'black' if bool(piece & 8) else 'white'
+                key = f"{p_color}_{type_piece}"
+                if key in chess_engine.org_imgs:
+                    if key not in chess_engine.images or chess_engine.images[key].get_width() != sqsize:
+                        chess_engine.images[key] = pg.transform.smoothscale(chess_engine.org_imgs[key], (sqsize, sqsize))
+                    img = chess_engine.images[key]
+                    img_rect = img.get_rect(center=(x_offset + c*sqsize + sqsize//2, 
+                                                    y_offset + r*sqsize + sqsize//2))
+                    self.surface.blit(img, img_rect)
+                else:
+                    rgb = (255,255,255) if p_color=='white' else (0,0,0)
+                    bg = (255,255,255) if p_color!='white' else (0,0,0)
+                    txt_surf = self.font.render(f"{type_piece}", True, rgb, bgcolor=bg)
+                    txt_rect = txt_surf.get_rect(center=(x_offset + c*sqsize + sqsize//2, 
+                                                         y_offset + r*sqsize + sqsize//2))
+                    self.surface.blit(txt_surf, txt_rect)
+
+    def draw_fps(self, ai_thinking=False, show_drag=False):
+        width, height = self.surface.get_size()
+        player = self.player
+        sidebar_width = 200
+        sidebar_x = width - sidebar_width
+        pg.draw.rect(self.surface, (40, 40, 50), (sidebar_x, 0, sidebar_width, height))
+        pg.draw.line(self.surface, (255, 255, 255), (sidebar_x, 0), (sidebar_x, height), 3)
+        text_x = sidebar_x + 30
+        lives_txt = self.font.render(f"Lives: {player.lives}", True, (255, 50, 50))
+        score_txt = self.font.render(f"Score: {player.score}", True, (255, 255, 255))
+        dragon_txt = self.font.render(f"Dragons: {player.dragons_beaten}", True, (255, 215, 0))
+        self.surface.blit(lives_txt, (text_x, 50))
+        self.surface.blit(score_txt, (text_x, 100))
+        self.surface.blit(dragon_txt, (text_x, 150))
+        if show_drag:
+            drag_mode = 'thinking' if ai_thinking else 'normal'
+            key = f'dragon_{drag_mode}.png'
+            center_y = height // 2
+            if key in self.images:
+                img = self.images[key]
+                img_rect = img.get_rect(center=(sidebar_x+(sidebar_width//2), center_y))
+                self.surface.blit(img, img_rect)
+            else:
+                fallback_txt = self.font.render(f'[{drag_mode.upper()}]', True, (255, 0, 255))
+                txt_rect = fallback_txt.get_rect(center=(sidebar_x+(sidebar_width//2), center_y))
+                self.surface.blit(fallback_txt, txt_rect)
+    
+    def start_2d(self):
+        self.surface.fill((0, 0, 0, 0))
+
+    def draw_minimap(self, grid, player, wall_color: tuple, portal_color: tuple):
+        width, height = self.surface.get_size()
+        padding = 10
+
+        radius_bonus   = player.minimap_radius_bonus
+        effective_r    = int(self.minimap_radius * radius_bonus)
+
+        center_x = width - effective_r - padding
+        center_y = (height // 2)
+
+        vision_range = 15 if player.gps else player.vision_range
+
+        pg.draw.circle(self.surface, (30, 30, 40, 200), (center_x, center_y), effective_r)
+        surf_size = int(effective_r * 3)
+        minimap_surf = pg.Surface((surf_size, surf_size), pg.SRCALPHA)
+        map_center = surf_size // 2
+        scale = effective_r / vision_range
+        px, py = float(player.pos[0]), float(player.pos[1])
+
+        start_r, end_r = max(0, int(py - vision_range - 1)), min(grid.shape[0], int(py + vision_range + 1))
+        start_c, end_c = max(0, int(px - vision_range - 1)), min(grid.shape[1], int(px + vision_range + 1))
+
+        wr_c, wg_c, wb_c = wall_color 
+        pr_c, pg_c, pb_c = portal_color
+        WALL_COLOR = (wr_c * 255, wg_c * 255, wb_c * 255, 255)
+        PORTAL_COLOR = (pr_c * 255, pg_c * 255, pb_c * 255, 255)
+        EMPTY_COLOR = (0, 0, 0, 255)
+        START_COLOR = (50, 255, 50, 255)
+        BOSS_COLOR = (150, 0, 150, 255)
+        DEFAULT_COLOR = (40, 40, 50, 255)
+        for r in range(start_r, end_r):
+            for c in range(start_c, end_c):
+                dx, dy = c - px, r - py
+                if math.hypot(dx, dy) <= vision_range:
+                    draw_x = int(map_center + (dx * scale))
+                    draw_y = int(map_center + (dy * scale))
+                    size = int(scale + 1) 
+
+                    val = grid[r, c]
+                    color = None
+                    
+                    if   val == 1: color = WALL_COLOR
+                    elif val == 0: color = EMPTY_COLOR
+                    elif val == 3: color = PORTAL_COLOR
+                    elif val == 2: color = START_COLOR
+                    elif val == 4: color = BOSS_COLOR
+                    else: color = DEFAULT_COLOR
+
+                    
+                    rect = pg.Rect(draw_x, draw_y, size, size)
+                    pg.draw.rect(minimap_surf, color, rect)
+        
+        if player.beacon and player.waypoints:
+            max_r_draw = effective_r - 8
+            for wp in player.waypoints.values():
+                dx_wp  = (wp.grid_c - px) * scale
+                dy_wp  = (wp.grid_r - py) * scale
+                dist_px = math.hypot(dx_wp, dy_wp)
+ 
+                if dist_px <= max_r_draw:
+                    # ── Waypoint is visible: draw labeled circle ──────────────
+                    draw_x = int(map_center + dx_wp)
+                    draw_y = int(map_center + dy_wp)
+                    pg.draw.circle(minimap_surf, (255, 215, 0, 230), (draw_x, draw_y), 7)
+                    pg.draw.circle(minimap_surf, (0, 0, 0, 200),     (draw_x, draw_y), 7, 1)
+                    lbl = self.wp_font.render(wp.label, True, (10, 10, 10))
+                    minimap_surf.blit(lbl, (draw_x - lbl.get_width() // 2,
+                                           draw_y - lbl.get_height() // 2))
+                else:
+                    # ── Waypoint is off-map: draw edge arrow ──────────────────
+                    if dist_px == 0:
+                        continue
+                    nx = dx_wp / dist_px
+                    ny = dy_wp / dist_px
+                    # arrow tip sits on the max_r_draw circle
+                    tip_x = int(map_center + nx * max_r_draw)
+                    tip_y = int(map_center + ny * max_r_draw)
+                    # two base corners of the triangle (perpendicular to direction)
+                    px_p, py_p = -ny, nx          # unit perpendicular
+                    base_x = int(tip_x - nx * 9)
+                    base_y = int(tip_y - ny * 9)
+                    left_x  = int(base_x + px_p * 5)
+                    left_y  = int(base_y + py_p * 5)
+                    right_x = int(base_x - px_p * 5)
+                    right_y = int(base_y - py_p * 5)
+                    pg.draw.polygon(minimap_surf, (255, 215, 0, 220),
+                                    [(tip_x, tip_y), (left_x, left_y), (right_x, right_y)])
+                    pg.draw.polygon(minimap_surf, (0, 0, 0, 160),
+                                    [(tip_x, tip_y), (left_x, left_y), (right_x, right_y)], 1)
+                    # label just behind the tip
+                    lbl = self.wp_font.render(wp.label, True, (255, 255, 255))
+                    minimap_surf.blit(lbl, (int(tip_x - nx * 12) - lbl.get_width() // 2,
+                                           int(tip_y - ny * 12) - lbl.get_height() // 2))
+
+        
+        if player.boss_tracker and player.dragons_beaten >= 2:
+            boss_positions = np.argwhere(grid == 4)
+            for pos in boss_positions:
+                br, bc = pos
+                dx_b = (bc - px) * scale
+                dy_b = (br - py) * scale
+                if math.hypot(bc - px, br - py) <= vision_range * 2:
+                    pg.draw.circle(minimap_surf, (200, 0, 200, 255),
+                                   (int(map_center + dx_b), int(map_center + dy_b)), 6)
+                    pg.draw.circle(minimap_surf, (255, 255, 255, 255),
+                                   (int(map_center + dx_b), int(map_center + dy_b)), 3)
+        
+        angle_deg = math.degrees(player.angle_x) + 90
+        rotated_surf = pg.transform.rotate(minimap_surf, angle_deg)
+        final_surf = pg.Surface((effective_r * 2, effective_r * 2), pg.SRCALPHA)
+
+        rotated_rect = rotated_surf.get_rect(center=(effective_r, effective_r))
+        final_surf.blit(rotated_surf, rotated_rect.topleft)
+
+        p_center = (effective_r, effective_r)
+        pg.draw.circle(final_surf, (0, 255, 255), p_center, 4)
+
+        mask_surf = pg.Surface((effective_r * 2, effective_r * 2), pg.SRCALPHA)
+        pg.draw.circle(mask_surf, (255, 255, 255, 255), p_center, effective_r)
+        final_surf.blit(mask_surf, (0, 0), special_flags=pg.BLEND_RGBA_MIN)
+
+        self.surface.blit(final_surf, (center_x - effective_r, center_y - effective_r))
+        pg.draw.circle(self.surface, (200, 200, 200), (center_x, center_y), effective_r, 3)
+
+
+
+============================================================
+SOURCE FILE: main.py
+============================================================
+
+from requirments import requirments
+print("All the libraries needed are about to be installed: ")
+requirments()
+
+from game import Game
+from maze_scene import MazeScene
+from menu_scenes import StartScreen
+import pygame as pg
+import sys
+
+def main():
+    playing = True
+    while playing:    
+        game = Game()
+        maze_scene = MazeScene(game)
+        
+        #print(game.map_gen) # FOR DEBUGGING AND DEVELOPER EASE ONLY (AKA WHEN WE HAD TO FIND A GAME TO PLAY EACH TIME)
+        
+        game.maze_scene = maze_scene
+        game_start_screen = StartScreen(game)
+        game.change_scene(game_start_screen)
+
+        # pg.event.set_grab(True)
+        pg.mouse.set_visible(True)
+        playing = game.run()
+        if playing:
+            pg.quit()
+            pg.init()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+SOURCE FILE: map_gen.py
+============================================================
+
+import numpy as np
+from numba import njit
+
+game_dict = {
+    1: 'wall',
+    0: 'room',
+    2: 'start',
+    4: 'boss_start',
+    3: 'battles'
+}
+
+class MapGen:
+    def __init__(self, numBattles:int = 4, difficulty:int = 2, maze_size=(20, 20)):
+        self.size = maze_size
+        self.grid = np.ones(self.size, dtype=np.int8)
+        self.numBattles = numBattles
+        self.difficulty = difficulty
+
+    def generate_full(self):
+        maze_obj = MazeGen(self.size, self.numBattles, self.difficulty)
+        maze_obj.gen_maze()
+        self.grid = maze_obj.maze.copy()
+
+        self.grid[1: 5, 1: 5] = 0
+        self.grid[2, 2] = 2
+
+        self.grid[-6: -1, -6: -1] = 0
+        self.grid[-3, -3] = 4
+        return self.grid, maze_obj.portals
+
+    def __repr__(self):
+        maze_lst = []
+        symbols = {
+            0: "  ",
+            1: "██",
+            2: "ST",
+            3: "BT",
+            4: "BS"
+        }
+        for row in self.grid:
+            maze_lst.append("".join(symbols.get(int(x), "NA") for x in row))
+        return "\n".join(maze_lst)
+
+
+class MazeGen:
+    def __init__(self, size_desired:tuple, numBattles:int, level:int = 2):
+        w, h = size_desired
+        w, h = [side if side % 2 == 1 else side + 1 for side in [w, h]]
+        self.size = (w, h)
+        self.num_Battles = numBattles
+        self.level = level
+        self.maze = None
+        self.portals = {}
+
+    def gen_maze(self):
+        w, h = self.size
+        maze = _gen_maze(h=h, w=w)
+        maze = _detail_maze(self.num_Battles, maze, w, h, 3)
+        maze = _easify(self.level, maze, w=w, h=h)
+
+        self.maze = maze
+        self.portals = {}
+
+        portal_idxs = np.argwhere(maze == 3)
+        for idx, pos in enumerate(portal_idxs):
+            self.portals[f'portal {idx+1}'] = (int(pos[0]), int(pos[1]))
+
+
+@njit
+def _gen_maze(h, w):
+    maze = np.ones((h, w), dtype=np.int8)
+    start_r, start_c = 1, 1
+    maze[start_r, start_c] = 0
+
+    stack = [(start_r, start_c)]
+    dirs = np.array([(0, 2), (2, 0), (-2, 0), (0, -2)])
+
+    while len(stack) > 0:
+        sq_r, sq_c = stack[-1]
+        neighbors = []
+
+        for i in range(4):
+            dr, dc = dirs[i]
+            nr, nc = sq_r + dr, sq_c + dc
+            if 0 < nr < h-1 and 0 < nc < w-1:
+                if maze[nr, nc] == 1:
+                    neighbors.append((nr, nc))
+
+        if len(neighbors) == 0:
+            stack.pop()
+        else:
+            idx = np.random.randint(0, len(neighbors))
+            nr, nc = neighbors[idx]
+
+            maze[nr, nc] = 0
+            maze[(sq_r + nr) // 2, (sq_c + nc) // 2] = 0
+            stack.append((nr, nc))
+
+    return maze
+
+@njit
+def _easify(level, maze, w, h):
+    if level == 2:
+        return maze
+
+    probs = 0.5 if level == 0 else 0.3
+    for r in range(1, h-1, 2):
+        for c in range(1, w-1, 2):
+            if maze[r, c] == 0:
+                wall_cnt = 0
+                wall_lst = np.zeros((4, 2), dtype=np.int32)
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
+                    if 0 < nr < h-1 and 0 <nc < w-1: 
+                        if maze[nr, nc] == 1:
+                            wall_lst[wall_cnt, 0] = nr
+                            wall_lst[wall_cnt, 1] = nc
+                            wall_cnt += 1
+                if wall_cnt == 3:
+                    if np.random.random() < probs:
+                        idx = np.random.randint(0, wall_cnt)
+                        chosen_r = wall_lst[idx, 0]
+                        chosen_c = wall_lst[idx, 1]
+                        maze[chosen_r, chosen_c] = 0
+    return maze
+
+
+@njit
+def _detail_maze(num_Battles, maze, w, h, num):
+    cnt = 0
+    for _ in range(99): 
+        for r in range(1, h-1):
+            for c in range(1, w-1):
+                if not (r <= 3 and c <= 3) and not (r >= h-6 and c >= w-6):
+                    if cnt >= num_Battles:
+                        return maze
+                    if maze[r, c] == 0:
+                        wall_cnt = 0
+                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            if maze[r+dr, c+dc] == 1:
+                                wall_cnt +=1
+                        if wall_cnt == 3:
+                            if np.random.random() < 0.36:
+                                maze[r, c] = num
+                                cnt += 1
+    if cnt < 5:
+        for _ in range(3): 
+            for r in range(1, h-1):
+                for c in range(1, w-1):
+                    if not (r <= 3 and c <= 3) and not (r >= h-6 and c >= w-6):
+                        if cnt >= 9:
+                            return maze
+                        if maze[r, c] == 0:
+                            wall_cnt = 0
+                            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                                if maze[r+dr, c+dc] == 1:
+                                    wall_cnt +=1
+                            if wall_cnt >= 2:
+                                if np.random.random() < 0.36:
+                                    maze[r, c] = num
+                                    cnt += 1
+    return maze
+
+============================================================
+SOURCE FILE: maze_scene.py
+============================================================
+
+import pygame as pg
+import random
+import math
+from scene import Scene
+from battle_scene import BattleScene
+from taming_scene3 import TamingScene
+from game import Game
+from pause_scene import PauseScene
+from player import Waypoint
+
+class MazeScene(Scene):
+    def __init__(self, game):
+        super().__init__(game)
+        self.map_mode = False
+
+    def handle_event(self, event):
+        
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                if self.map_mode:
+                    self._exit_map_mode()
+                else:
+                    self.game.change_scene(PauseScene(self.game, self))
+
+            player = self.game.player
+
+            if event.key == pg.K_t:
+                if player.warp and player.teleport_to_end_available:
+                    rows, cols = self.game.grid.shape
+                    player.pos[0] = float(cols - 4)   # x = column near boss
+                    player.pos[1] = float(rows - 4)   # y = row near boss
+                    player.teleport_to_end_available = False
+                    print("WARP! Teleported near the boss battle!")
+
+            if event.key == pg.K_m and player.beacon:
+                if self.map_mode:
+                    self._exit_map_mode()
+                else:
+                    self._enter_map_mode()
+            
+            if event.key == pg.K_h and player.home_beacon:
+                player.set_named_waypoint('H', 2, 2)
+                print("Home Waypoint", "cleared" if 'H' not in player.waypoints else "set")
+            if event.key == pg.K_p and player.portal_beacon:
+                result = player.nearest_portal(self.game.grid)
+                if result:
+                    r, c = result
+                    player.set_named_waypoint('P', r, c)
+                    print('Portal waypoint', "cleared" if 'P' not in player.waypoints else f"set at ({r},{c})")
+
+        if event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            player = self.game.player
+            if self.map_mode and player.beacon:
+                self._try_set_waypoint(event.pos)
+
+    def _enter_map_mode(self):
+        self.map_mode = True
+        pg.event.set_grab(False)
+        pg.mouse.set_visible(True)
+        self.game.player.can_move = False
+ 
+    def _exit_map_mode(self):
+        self.map_mode = False
+        pg.event.set_grab(True)
+        pg.mouse.set_visible(False)
+        self.game.player.can_move = True
+    
+    def _try_set_waypoint(self, mouse_pos):
+        """A click on minimap => grid coord waypoint"""
+        player = self.game.player
+        surf = self.game.graphic2d_surf
+        width, height = surf.get_size()
+
+        radius_bonus = player.minimap_radius_bonus
+        effective_r = int(self.game.graphic2d.minimap_radius * radius_bonus)
+        padding = 10
+        center_x = width - effective_r - padding
+        center_y = height // 2
+        mx, my = mouse_pos
+        dx_px, dy_px = mx - center_x, my-center_y
+        if dx_px * dx_px + dy_px * dy_px > effective_r * effective_r: return # using pythagorean theorem
+
+        angle_deg = math.degrees(player.angle_x) + 90
+        angle_rad = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+        ux = dx_px * cos_a - dy_px * sin_a
+        uy = dx_px * sin_a + dy_px * cos_a
+
+        vision_range = 15 if player.gps else player.vision_range
+        scale = effective_r / vision_range
+
+        grid_c = int(player.pos[0] + ux / scale)
+        grid_r = int(player.pos[1] + uy / scale)
+
+        rows, cols = self.game.grid.shape
+        grid_r = max(0, min(rows - 1, grid_r))
+        grid_c = max(0, min(cols - 1, grid_c))
+
+        player.place_custom_waypoint(grid_r, grid_c)
+            
+    def update(self):
+        if self.map_mode: return 
+        game = self.game
+        keys = pg.key.get_pressed()
+        game.player.update(keys, game.grid, game.delta_time)
+
+        r, c = int(game.player.pos[1]), int(game.player.pos[0])
+        tile_val = game.grid[r, c]
+
+        if tile_val == 3:
+            game.current_battle_pos = (r, c) #type: ignore
+            game.player.playing_chess = True
+            if random.random() < game.player.chance_of_chess:
+                game.change_scene(BattleScene(game))
+            else:
+                game.change_scene(TamingScene(game))
+        
+        elif tile_val == 4:
+            if game.player.dragons_beaten >= 2:
+                print("Time to fight the boss! You can do it!")
+                game.current_battle_pos = (r, c) #type: ignore
+                game.player.playing_chess = True
+
+                power_up = 0
+                if game.player.dragons_beaten > 2:
+                    power_up = min(game.player.dragons_beaten, 8)
+
+                if random.random() <= game.player.chance_of_chess:
+                    game.change_scene(BattleScene(game, is_boss=True, super_mode=power_up))
+                else:
+                    game.change_scene(TamingScene(game, is_boss=True))
+            else:
+                game.player.pos[0] -= 0.3
+                game.player.pos[1] -= 0.3
+                print("You have to defeat more dragons to be able to fight the boss!")
+    
+    def render(self):
+        game: Game = self.game
+        game.graphic3d.update_view(game.player)
+        game.graphic3d.render_maze(game.grid, game.wall_color, game.portal_color, game.player)
+        
+        game.graphic2d.start_2d()
+        game.graphic2d.draw_fps()
+        game.graphic2d.draw_minimap(game.grid, game.player, game.wall_color, game.portal_color)
+
+        game.graphic3d.render_2d_surf(game.graphic2d_surf)
+
+============================================================
+SOURCE FILE: menu_scenes.py
+============================================================
+
+import pygame as pg, sys
+from scene import Scene
+from ui import UI_MANAGER, Button, Slider
+ 
+class StartScreen(Scene):
+    def __init__(self, game):
+        super().__init__(game)
+        self.manager = UI_MANAGER(game.graphic2d_surf)
+        self.font = pg.font.Font(None, 60)
+        self.small_font = pg.font.Font(None, 36)
+        self.edit_mode = 0
+ 
+        self.button_wall = self.manager.add_element(
+            Button, "Edit Walls", on_click=lambda: self.set_mode(0),
+            alignment='TOP CENTER_X', x_offset=-300, y_offset=160, width=150, toggle=False
+        )
+        self.button_portal = self.manager.add_element(
+            Button, "Edit Portals", on_click=lambda: self.set_mode(1),
+            alignment='TOP CENTER_X', x_offset=-140, y_offset=160, width=150, toggle=False
+        )
+        
+        self.slider_r = self.manager.add_element(Slider, "Wall Red", alignment='TOP CENTER_X',
+                                                 x_offset=-220, y_offset=240, height=20, width=250,
+                                                 initial_val=0.3)
+        self.slider_g = self.manager.add_element(Slider, "Wall Green", alignment='TOP CENTER_X',
+                                                 x_offset=-220, y_offset=320, height=20, width=250,
+                                                 initial_val=0.3)
+        self.slider_b = self.manager.add_element(Slider, "Wall Blue", alignment='TOP CENTER_X',
+                                                 x_offset=-220, y_offset=400, height=20, width=250,
+                                                 initial_val=0.3)
+ 
+        self.slider_mode = self.manager.add_element(Slider, "CHESS PROBABILITY", alignment='TOP CENTER_X',
+                                                     x_offset=220, y_offset=240, height=20, width=280,
+                                                     initial_val=0.5)
+        
+        self.button_start = self.manager.add_element(Button, "Begin Game", on_click=self.start_game,
+                                                    alignment='BOTTOM CENTER_X', y_offset=-40, width=300,
+                                                    height=60, ACTIVE_COLOR=(100, 255, 100))
+        
+        self.slider_difficulty_chess = self.manager.add_element(
+            Slider, "CHESS DIFFICULTY", alignment='TOP CENTER_X', x_offset=220, y_offset=320, height=20, width=280)
+        self.slider_difficulty_fps = self.manager.add_element(
+            Slider, "FPS DIFFICULTY", alignment='TOP CENTER_X', x_offset=220, y_offset=400, height=20, width=280)
+        
+        self.button_wall.is_active = True
+        
+    def set_mode(self, mode):
+        self.edit_mode = mode
+        self.button_wall.is_active = (mode == 0)
+        self.button_portal.is_active  = (mode == 1)
+        current_color = self.game.wall_color if mode == 0 else self.game.portal_color
+ 
+        self.slider_r.value = current_color[0]
+        self.slider_g.value = current_color[1]
+        self.slider_b.value = current_color[2]
+        
+        self.slider_r.update_knob_pos()
+        self.slider_g.update_knob_pos()
+        self.slider_b.update_knob_pos()
+        
+        self.slider_mode.update_knob_pos() 
+    
+    def start_game(self):
+        pg.event.set_grab(True)
+        pg.mouse.set_visible(False)
+        self.game.change_scene(self.game.maze_scene)
+    
+    def handle_event(self, event):
+        if event.type == pg.KEYDOWN:
+            if event.type == pg.QUIT:
+                pg.quit()
+                sys.exit()
+        self.manager.handle_event(event)
+    
+    def update(self):
+        self.manager.update()
+        r = self.slider_r.get_val(0, 1)
+        g = self.slider_g.get_val(0, 1)
+        b = self.slider_b.get_val(0, 1)
+ 
+        self.game.player.chance_of_chess = round(self.slider_mode.get_val(0, 1), 3)
+ 
+        self.game.player.chess_difficulty = round(self.slider_difficulty_chess.get_val(0,1), 2)
+        self.game.player.fps_difficulty = round(self.slider_difficulty_fps.get_val(0,1), 2)
+ 
+        self.game.player.time_limit_of_AI = round(self.slider_difficulty_chess.get_val(5.5,20.0), 2)
+        self.game.player.time_limit_of_fps = round(self.slider_difficulty_fps.get_val(30.0,5.0), 2)
+        
+        self.game.player.fps_block_speed_multiplier = round(self.slider_difficulty_fps.get_val(0.1, 0.5), 2)    
+        self.game.player.fps_block_size_multiplier = round(self.slider_difficulty_fps.get_val(1.5, 0.5), 2)
+        
+        n_color = (r, g, b)
+        if self.edit_mode == 0:
+            self.game.wall_color = n_color
+        else:
+            self.game.portal_color = n_color
+    
+    def render(self):
+        WIDTH, HEIGHT = self.game.graphic2d_surf.get_size()
+        self.game.graphic2d_surf.fill((30, 30, 40))
+        title = self.font.render("Dragon Chess Maze", True, (255, 215, 0))
+        rect = title.get_rect(center=(WIDTH//2, 100))
+        self.game.graphic2d_surf.blit(title, rect)
+ 
+        looks_subtitle = self.small_font.render("LOOKS:", True, (255, 255, 255))
+        looks_rect = looks_subtitle.get_rect(center=(WIDTH//2 - 220, 150))
+        self.game.graphic2d_surf.blit(looks_subtitle, looks_rect)
+ 
+        preview_color_box = (int(self.slider_r.get_val(0, 255)),
+                             int(self.slider_g.get_val(0, 255)),
+                             int(self.slider_b.get_val(0, 255)))
+        
+        preview_box_rect = pg.Rect(0, 0, 120, 100)
+        preview_box_rect.center = (WIDTH//2 - 220, 552)
+        pg.draw.rect(self.game.graphic2d_surf, preview_color_box, preview_box_rect, border_radius=10)
+        pg.draw.rect(self.game.graphic2d_surf, (255, 255, 255), preview_box_rect, 3, border_radius=10)
+ 
+        diff_txt = self.small_font.render("DIFFICULTY SETTINGS:", True, (255,255,255))
+        diff_rect = diff_txt.get_rect(center=(WIDTH//2 + 220, 150))
+        self.game.graphic2d_surf.blit(diff_txt, diff_rect)
+ 
+        self.manager.draw()
+        self.game.graphic3d.render_2d_surf(self.game.graphic2d_surf)
+    
+    def resize(self, width, height):
+        self.manager.handle_resize(width, height, self.game.graphic2d_surf)
+ 
+class EndScreen(Scene):
+    def __init__(self, game, victory=True):
+        super().__init__(game)
+        self.manager = UI_MANAGER(game.graphic2d_surf)
+        self.victory = victory
+        self.font = pg.font.Font(None, 50)
+ 
+        self.button_quit = self.manager.add_element(
+            Button, "QUIT GAME!", on_click=self.quit_game,
+            alignment='CENTER_BOTH', y_offset=45, height=60,
+        )
+        self.button_restart = self.manager.add_element(
+            Button, "RETRY GAME!", on_click=self.retry_game,
+            alignment='CENTER_BOTH', y_offset=-45, height=60
+        )
+    
+    def quit_game(self):
+        self.game.running = False
+ 
+    def retry_game(self):
+        self.game.retry = True
+        self.game.running = False
+ 
+    def handle_event(self, event):
+        if event.type == pg.KEYDOWN:
+            if event.type == pg.QUIT:
+                pg.quit()
+                sys.exit()
+        self.manager.handle_event(event)
+    
+    def update(self):
+        self.manager.update()
+    
+    def render(self):
+        WIDTH, HEIGHT = self.game.graphic2d_surf.get_size()
+        self.game.graphic2d_surf.fill((0, 0, 0))
+        msg = "VICTORY!" if self.victory else "GAME OVER! BETTER LUCK NEXT TIME!"
+        color = (215, 215, 0) if self.victory else (200, 50, 50)
+ 
+        text = self.font.render(msg, True, color)
+        rect = text.get_rect(center=(WIDTH//2, HEIGHT//2 - 175))
+        self.game.graphic2d_surf.blit(text, rect)
+        score_font = pg.font.Font(None, 50)
+        score_text = score_font.render(f"Final Score: {self.game.player.score}", True, (255, 255, 255))
+        score_rect = score_text.get_rect(center=(WIDTH//2, HEIGHT//2-125))
+        self.game.graphic2d_surf.blit(score_text, score_rect)
+ 
+        self.manager.draw()
+        self.game.graphic3d.render_2d_surf(self.game.graphic2d_surf)
+    
+    def resize(self, width, height):
+        self.manager.handle_resize(width, height, self.game.graphic2d_surf)
+
+============================================================
+SOURCE FILE: old_pause_scene.py
+============================================================
+
+import pygame as pg
+from scene import Scene
+from ui import UI_MANAGER, Button
+from menu_scenes import StartScreen
+from typing import Callable
+
+from game import Game # To delete
+from player import Player
+
+class PauseScene(Scene):
+    def __init__(self, game: Game, previous_scene):
+        super().__init__(game)
+        self.prev_scene = previous_scene
+        self.manager = UI_MANAGER(game.graphic2d_surf)
+
+        pg.event.set_grab(False)
+        pg.mouse.set_visible(True)
+
+        self.manager.add_element(Button, "Resume", on_click=self.resume,
+                                 alignment='CENTER_BOTH', y_offset=-120)
+        self.manager.add_element(Button, "SKILL TREE", on_click=self.open_skill_tree,
+                                 alignment='CENTER_BOTH', y_offset=-40)
+        self.manager.add_element(Button, "QUIT TO MENU", on_click=self.quit,
+                                 alignment='CENTER_BOTH', y_offset=40, ACTIVE_COLOR=(255, 100, 100))
+        self.font = pg.font.Font(None, 100)
+
+    def resume(self):
+        pg.event.set_grab(True)
+        pg.mouse.set_visible(False)
+        self.game.change_scene(self.prev_scene)
+    
+    def open_skill_tree(self):
+        self.game.change_scene(SkillTreeScene(self.game, self))
+    
+    def quit(self):
+        self.game.change_scene(StartScreen(self.game))
+    
+    def handle_event(self, event):
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                self.resume()
+        self.manager.handle_event(event)
+
+    def update(self):
+        self.manager.update()
+    
+    def render(self):
+        self.prev_scene.render()
+        graphic2d_surf = self.game.graphic2d_surf
+        width, height = graphic2d_surf.get_size()
+        overlay = pg.Surface((width, height), pg.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        graphic2d_surf.blit(overlay, (0, 0))
+        txt = self.font.render("PAUSED", True, (255, 255, 255))
+        rect = txt.get_rect(center=(width//2, 100))
+        graphic2d_surf.blit(txt, rect)
+        self.manager.draw()
+        self.game.graphic3d.render_2d_surf(graphic2d_surf)
+    
+    def resize(self, width, height):
+        self.prev_scene.resize(width, height)
+        self.manager.handle_resize(width, height, self.game.graphic2d_surf)
+
+class SkillTreeScene(Scene):
+    def __init__(self, game: Game, pause_menu):
+        super().__init__(game)
+        self.pause_menu: PauseScene = pause_menu
+        self.ui_manager = UI_MANAGER(game.graphic2d_surf)
+        self.skill_manager = Skill_Manager({
+            "root": Skill(
+        name="root", description="Start", cost=0, prereqs=[],
+        branches=[], branch_name="purple",
+        effect=lambda p: None,
+        pos=(400, 80), color=(160, 100, 220)
+    ),
+    "tough_scales": Skill(
+        name="tough_scales", description="+1 life", cost=200, prereqs=["root"],
+        branches=[], branch_name="coral",
+        effect=lambda p: setattr(p, "lives", p.lives + 1),
+        pos=(200, 220), color=(220, 90, 70)
+    ),
+    "chess_instinct": Skill(
+        name="chess_instinct", description="AI -3s", cost=300, prereqs=["root"],
+        branches=[], branch_name="blue",
+        effect=lambda p: setattr(p, "time_limit_of_AI", p.time_limit_of_AI + 3),
+        pos=(400, 220), color=(60, 130, 220)
+    ),
+    "hunters_eye": Skill(
+        name="hunters_eye", description="Targets slower", cost=300, prereqs=["root"],
+        branches=[], branch_name="teal",
+        effect=lambda p: setattr(p, "fps_block_speed_multiplier", p.fps_block_speed_multiplier * 0.8),
+        pos=(600, 220), color=(40, 180, 150)
+    ),
+    "iron_will": Skill(
+        name="iron_will", description="+2 lives", cost=500, prereqs=["tough_scales"],
+        branches=[], branch_name="coral",
+        effect=lambda p: setattr(p, "lives", p.lives + 2),
+        pos=(200, 380), color=(220, 90, 70)
+    ),
+    "grandmaster": Skill(
+        name="grandmaster", description="AI -8s", cost=700, prereqs=["chess_instinct"],
+        branches=[], branch_name="blue",
+        effect=lambda p: setattr(p, "time_limit_of_AI", p.time_limit_of_AI + 8),
+        pos=(400, 380), color=(60, 130, 220)
+    ),
+    "hawk_sight": Skill(
+        name="hawk_sight", description="+10s FPS", cost=400, prereqs=["hunters_eye"],
+        branches=[], branch_name="teal",
+        effect=lambda p: setattr(p, "time_limit_of_fps", p.time_limit_of_fps + 10),
+        pos=(600, 380), color=(40, 180, 150)
+    ),
+
+        }, self.game.graphic2d_surf)
+        self.branches = []
+        self.selected = None
+        self.scroll_y = 0
+
+        self.ui_manager.add_element(Button, "GO BACK", on_click=self.go_back,
+                                 alignment='BOTTOM CENTER_X', y_offset=-40)
+        
+        self.node_rects = {}
+    
+    def go_back(self):
+        self.game.change_scene(self.pause_menu)
+    
+    def handle_event(self, event):
+        if event.type == pg.MOUSEMOTION:
+            self.selected = None
+            for name, rect in self.node_rects.items():
+                rect: pg.Rect
+                if rect.collidepoint(event.pos):
+                    self.selected = self.skill_manager.get_by_name(name)
+                    break
+        if event.type == pg.MOUSEBUTTONDOWN and self.selected:
+            self.skill_manager.try_buy(self.selected, self.game.player,
+                                       self.game.player.unlocked_skills)
+        if event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                self.go_back()
+        self.ui_manager.handle_event(event)
+    
+    def update(self):
+        self.ui_manager.update()
+        self.skill_manager.update_states(self.game.player.score,
+                                         self.game.player.unlocked_skills)
+    
+    def render(self):
+        graphic_2d_surf = self.game.graphic2d_surf
+        graphic_2d_surf.fill((20, 25, 35))
+        self.node_rects = self.skill_manager.draw_all(self.selected,
+                                                      0, self.scroll_y)
+        self.ui_manager.draw()
+
+        self.game.graphic3d.render_2d_surf(graphic_2d_surf)
+
+    def resize(self, width, height):
+        self.ui_manager.handle_resize(width, height, self.game.graphic2d_surf)
+        self.skill_manager.handle_resize(self.game.graphic2d_surf)
+
+class Skill():
+    _font_small = None
+    _font_large = None
+    def __init__(self, name: str, description: str, cost: int,
+                 prereqs: list, branches: list, branch_name: str,
+                 effect: Callable, pos: tuple, color: tuple, 
+                 state: str = "locked", width: int = 150, 
+                 height: int = 60,):
+
+        self.name = name
+        self.description = description
+        self.cost = cost
+        self.prereqs = prereqs
+        self.branches = branches
+        self.branch_name = branch_name
+        self.effect = effect
+        self.state = state # can be "locked", "unlocked", "available"
+        self.org_pos = pos
+        self.pos = list(pos)
+        if Skill._font_small is None or Skill._font_large is None:
+            Skill._font_small = pg.font.Font(None, 21)
+            Skill._font_large = pg.font.Font(None, 30)
+        self.font_small = Skill._font_small
+        self.font_large = Skill._font_large 
+        self.width, self.height = width, height
+        self.color = color
+    
+    def is_available(self, player_balance, unlocked_set):
+        if self.state == "unlocked": return False
+        prereqs_met = all(p in unlocked_set for p in self.prereqs)
+        return prereqs_met and self.cost <= player_balance
+    
+    def draw(self, surface, selected, scroll_x, scroll_y):
+        cx, cy = self.pos
+        cx += scroll_x
+        cy += scroll_y
+        width, height = self.width, self.height
+        rect = pg.Rect(cx - width//2, cy - height//2, width, height)
+        color = self.color
+        state = self.state
+
+        if state == "unlocked":
+            bgc = (color[0]//2, color[1]//2, color[2]//2)  # dimmed
+            fc = (180, 180, 180)
+            border = color
+        elif state == "available":
+            bgc = color
+            fc = (255, 255, 255)
+            border = (255, 215, 0)  # gold border = buyable
+        else:  # locked
+            bgc = (30, 30, 38)
+            fc = (80, 80, 90)
+            border = (60, 60, 70)
+        
+        pg.draw.rect(surface, bgc, rect, border_radius=10)
+        pg.draw.rect(surface, border, rect, 2, border_radius=10)
+        if selected:
+            pg.draw.rect(surface, (255, 255, 255), rect, 3, border_radius=10)
+        
+        name_surf = self.font_large.render(self.name, True, fc)
+        desc_color = (120, 120, 130) if state == "unlocked" else (fc[0]//2, fc[1]//2, fc[2]//2)
+        desc_surf = self.font_small.render(self.description, True, desc_color)
+        surface.blit(name_surf, name_surf.get_rect(centerx=rect.centerx, y=rect.y + 10))
+        surface.blit(desc_surf, desc_surf.get_rect(centerx=rect.centerx, y=rect.y + 34))
+        return rect
+
+    def resize(self, width_diff, height_diff):
+        self.pos[0] += width_diff
+        self.pos[1] += height_diff
+
+class Skill_Manager():
+    def __init__(self, skills: dict, surface):
+        self.skills = skills
+        self.surface = surface
+    
+    def get_by_name(self, name):
+        return self.skills.get(name, None)
+
+    def update_states(self, player_balance, unlocked_set):
+        for skill in self.skills.values():
+            if skill.name in unlocked_set:
+                skill.state = "unlocked"
+            elif skill.is_available(player_balance, unlocked_set):
+                skill.state = "available"
+            else:
+                skill.state = "locked"
+    
+    def try_buy(self, skill: Skill, player, unlocked_set):
+        if not skill.is_available(player.score, unlocked_set):
+            return False
+        player.score -= skill.cost
+        skill.effect(player)
+        unlocked_set.add(skill.name)
+        skill.state = "unlocked"
+        return True
+    
+    def draw_connections(self, scroll_x, scroll_y):
+        for skill in self.skills.values():
+            cx_b = skill.pos[0] + scroll_x
+            cy_b = skill.pos[1] + scroll_y
+            for prereq_name in skill.prereqs:
+                prereq = self.get_by_name(prereq_name)
+                if prereq:
+                    cx_a = prereq.pos[0] + scroll_x
+                    cy_a = prereq.pos[1] + scroll_y
+                    both_active = prereq.state == "unlocked" and skill.state != "locked"
+                    color = (180, 180, 180) if both_active else (70, 70, 70)
+                    pg.draw.line(self.surface, color, (cx_a, cy_a), (cx_b, cy_b), 3)
+    
+    def draw_all(self, selected_skill, scroll_x, scroll_y):
+        self.draw_connections(scroll_x, scroll_y)
+        rects = {}
+        for name, skill in self.skills.items():
+            rects[name] = skill.draw(self.surface, skill is selected_skill, scroll_x, scroll_y)
+        return rects
+
+    def change_surface(self, surface):
+        self.surface = surface
+    
+    def handle_resize(self, surface):
+        self.change_surface(surface)
+        width, height = self.surface.get_size()
+        for skill in self.skills.values():
+            skill.resize(width, height)
+
+
+============================================================
+SOURCE FILE: pause_scene.py
+============================================================
+
+import pygame as pg
+from scene import Scene
+from ui import UI_MANAGER, Button
+from menu_scenes import StartScreen
+from typing import Callable
+from game import Game
+
+# ── LAYOUT ────────────────────────────────────────────────────────────────────
+SX = 185
+SY = 90
+_T1, _T2           = -int(SY*1.6), -int(SY*3.2)
+_B1, _B2, _B3      =  int(SY*1.6),  int(SY*3.2),  int(SY*4.8)
+
+BRANCH_COLORS = {
+    "crimson":  (190,  45,  45),
+    "sapphire": ( 45,  95, 210),
+    "emerald":  ( 35, 165,  75),
+    "amber":    (205, 145,  20),
+    "root":     (145,  85, 215),
+}
+ 
+# ── compass is gone; replaced by home_beacon / portal_beacon / multi_beacon ──
+SKILL_OFFSETS = {
+    "root":            (      0,    0),
+    # Sentinel (Chess) — top-left, crimson
+    "pawn_shield":     (   -SX,  _T1), "royal_guard":     (-SX*2,  _T1), "ai_fatigue":      (-SX*3,  _T1),
+    "dragons_blunder": (   -SX,  _T2), "blitz_specialist":(-SX*2,  _T2), "berserker_king":  (-SX*3,  _T2),
+    # Guardian (Defense) — top-right, sapphire
+    "sturdy_mind":     (    SX,  _T1), "iron_will":       ( SX*2,  _T1), "peace_treaty":    ( SX*3,  _T1),
+    "soft_landing":    (    SX,  _T2), "second_wind":     ( SX*2,  _T2), "kings_ransom":    ( SX*3,  _T2),
+    # Explorer (Utility) — bottom-left, emerald
+    "swift_boots":     (   -SX,  _B1), "speedster":       (-SX*2,  _B1), "steady_hand":     (-SX*3,  _B1),
+    "sharp_eyes":      (   -SX,  _B2), "eagle_vision":    (-SX*2,  _B2), "extra_spoils":    (-SX*3,  _B2),
+    # Seer (Navigation) — bottom-right, amber
+    #   Row _B1: base beacon + named waypoint unlocks
+    "beacon":          (    SX,  _B1), "home_beacon":     ( SX*2,  _B1), "portal_beacon":   ( SX*3,  _B1),
+    #   Row _B2: multi-waypoint + detection skills
+    "portal_beacon":( SX*3,  _B1), "portal_tower": ( SX*4,  _B1),
+    "boss_tracker":    (    SX,  _B2), "multi_beacon":    ( SX*2,  _B2), "clarity":         ( SX*3,  _B2),
+    #   Row _B3: endgame nav
+    "gps":             ( SX*2,  _B3), "warp":            ( SX*3,  _B3),
+}
+ 
+BRANCH_LABELS = [
+    ("-- SENTINEL --", -SX*2, _T1 - 52, BRANCH_COLORS["crimson"]),
+    ("-- GUARDIAN --",  SX*2, _T1 - 52, BRANCH_COLORS["sapphire"]),
+    ("-- EXPLORER --", -SX*2, _B1 - 52, BRANCH_COLORS["emerald"]),
+    ("-- SEER --",      SX*2, _B1 - 52, BRANCH_COLORS["amber"]),
+]
+ 
+def _flag(attr):
+    return lambda p: setattr(p, attr, True)
+ 
+SKILL_EFFECTS = {
+    "root":            lambda p: None,
+    # Sentinel
+    "pawn_shield":     _flag("pawn_shield"),
+    "royal_guard":     _flag("royal_guard"),
+    "ai_fatigue":      _flag("ai_fatigue"),
+    "dragons_blunder": _flag("dragons_blunder"),
+    "blitz_specialist":_flag("blitz_specialist"),
+    "berserker_king":  _flag("berserker_king"),
+    # Guardian
+    "sturdy_mind":     lambda p: setattr(p, "lives", p.lives + 1),
+    "iron_will":       lambda p: setattr(p, "lives", p.lives + 1),
+    "peace_treaty":    _flag("peace_treaty"),
+    "soft_landing":    _flag("soft_landing"),
+    "second_wind":     _flag("second_wind"),
+    "kings_ransom":    _flag("kings_ransom"),
+    # Explorer
+    "swift_boots":     lambda p: setattr(p, "speed", p.speed * 1.15),
+    "speedster":       _flag("speedster"),
+    "steady_hand":     lambda p: setattr(p, "time_limit_of_fps", p.time_limit_of_fps + 10),
+    "sharp_eyes":      lambda p: setattr(p, "minimap_radius_bonus",
+                                          getattr(p, "minimap_radius_bonus", 1.0) * 1.2),
+    "eagle_vision":    lambda p: setattr(p, "minimap_radius_bonus", 1.5),
+    "extra_spoils":    _flag("extra_spoils"),
+    # Seer
+    "beacon":          _flag("beacon"),
+    "home_beacon":     _flag("home_beacon"),          # H key sets home waypoint
+    "portal_beacon":   _flag("portal_beacon"),        # P key sets portal waypoint
+    "multi_beacon":    lambda p: setattr(p, "max_waypoints", 3),  # 1 → 3 custom slots
+    "boss_tracker":    _flag("boss_tracker"),
+    "clarity":         _flag("clarity"),
+    "gps":             _flag("gps"),
+    "warp":            _flag("warp"),
+    "portal_tower":    _flag("portal_tower"),
+}
+ 
+SKILL_DEFS = {
+    "root":            ("DRAGON TAMER",     "Begin your journey",          0, [],                                       "root"),
+    # ── Sentinel ──────────────────────────────────────────────────────────────
+    "pawn_shield":     ("PAWN SHIELD",      "+1 extra pawn at start",    150, ["root"],                                 "crimson"),
+    "royal_guard":     ("ROYAL GUARD",      "One start pawn = Queen",    300, ["pawn_shield"],                          "crimson"),
+    "ai_fatigue":      ("AI FATIGUE",       "AI loses 2 depth/10 moves", 250, ["pawn_shield"],                          "crimson"),
+    "dragons_blunder": ("DRAGON'S BLUNDER", "AI plays its 3rd-best move",400, ["royal_guard"],                          "crimson"),
+    "blitz_specialist":("BLITZ SPECIALIST", "Win ≤40 moves = 2x pts",    400, ["ai_fatigue"],                           "crimson"),
+    "berserker_king":  ("BERSERKER KING",   "King jumps like Knight",     600, ["dragons_blunder", "blitz_specialist"], "crimson"),
+    # ── Guardian ──────────────────────────────────────────────────────────────
+    "sturdy_mind":     ("STURDY MIND",      "Additional life",           200, ["root"],                                 "sapphire"),
+    "iron_will":       ("IRON WILL",        "Additional life",           400, ["sturdy_mind"],                          "sapphire"),
+    "peace_treaty":    ("PEACE TREATY",     "Stalemates don't cost life",300, ["sturdy_mind"],                          "sapphire"),
+    "soft_landing":    ("SOFT LANDING",     "Loss = respawn near portal",250, ["peace_treaty"],                         "sapphire"),
+    "second_wind":     ("SECOND WIND",      "Survive death once per run",500, ["iron_will"],                            "sapphire"),
+    "kings_ransom":    ("KING'S RANSOM",    "Pay 500 pts to survive",    600, ["second_wind"],                          "sapphire"),
+    # ── Explorer ──────────────────────────────────────────────────────────────
+    "swift_boots":     ("SWIFT BOOTS",      "Move speed +15%",           200, ["root"],                                 "emerald"),
+    "speedster":       ("SPEEDSTER",        "Hold Shift = 2x speed",     300, ["swift_boots"],                          "emerald"),
+    "steady_hand":     ("STEADY HAND",      "FPS time limit +10s",       300, ["swift_boots"],                          "emerald"),
+    "sharp_eyes":      ("SHARP EYES",       "Minimap radius +20%",       200, ["swift_boots"],                          "emerald"),
+    "eagle_vision":    ("EAGLE VISION",     "Minimap radius x1.5 total", 400, ["sharp_eyes"],                           "emerald"),
+    "extra_spoils":    ("EXTRA SPOILS",     "+25% score per battle",     350, ["steady_hand"],                          "emerald"),
+    # ── Seer ──────────────────────────────────────────────────────────────────
+    "beacon":          ("BEACON",           "M = map mode, click=waypoint",200, ["root"],                               "amber"),
+    "home_beacon":     ("HOME BEACON",      "H key = home waypoint",     250, ["beacon"],                               "amber"),
+    "portal_beacon":   ("PORTAL BEACON",    "P key = nearest portal",    250, ["beacon"],                               "amber"),
+    "boss_tracker":    ("BOSS TRACKER",     "Boss dot after 2 kills",    250, ["beacon", "portal_tower"],                               "amber"),
+    "portal_tower": ("PORTAL TOWER", "Portals are tall pillars", 300, ["portal_beacon"], "amber"),
+    "multi_beacon":    ("MULTI BEACON",     "Up to 3 custom waypoints",  350, ["home_beacon"],                          "amber"),
+    "clarity":         ("CLARITY",          "No fog in the 3D maze",     500, ["boss_tracker"],                         "amber"),
+    "gps":             ("GPS",              "Full maze on minimap",      700, ["clarity"],                              "amber"),
+    "warp":            ("WARP",             "Teleport to boss once",     900, ["gps"],                                  "amber"),
+}
+
+# ── SKILL CLASS ───────────────────────────────────────────────────────────────
+class Skill:
+    _font_name = None
+    _font_desc = None
+
+    def __init__(self, name, display_name, description, cost, prereqs,
+                 branch_name, effect, pos, color,
+                 state="locked", width=162, height=58):
+        self.name         = name
+        self.display_name = display_name
+        self.description  = description
+        self.cost         = cost
+        self.prereqs      = prereqs
+        self.branch_name  = branch_name
+        self.effect       = effect
+        self.state        = state
+        self.pos          = pos
+        self.width        = width
+        self.height       = height
+        self.color        = color
+        if Skill._font_name is None:
+            Skill._font_name = pg.font.Font(None, 21)
+            Skill._font_desc = pg.font.Font(None, 19)
+
+    def is_available(self, player_score, unlocked_set):
+        if self.state == "unlocked":
+            return False
+        return all(p in unlocked_set for p in self.prereqs) and self.cost <= player_score
+
+    def draw(self, surface, selected, scroll_x, scroll_y):
+        cx = self.pos[0] + scroll_x
+        cy = self.pos[1] + scroll_y
+        rect = pg.Rect(cx - self.width//2, cy - self.height//2, self.width, self.height)
+        c = self.color
+        if self.state == "unlocked":
+            bgc = (c[0]//4, c[1]//4, c[2]//4)
+            fc  = (130, 130, 140)
+            border = (c[0]//2, c[1]//2, c[2]//2)
+            dc  = (90, 90, 100)
+        elif self.state == "available":
+            bgc = (c[0]//3+10, c[1]//3+10, c[2]//3+10)
+            fc  = (255, 255, 255)
+            border = (255, 215, 0)
+            dc  = (200, 200, 210)
+        else:
+            bgc = (24, 24, 32); fc = (60, 60, 72)
+            border = (44, 44, 56); dc = (48, 48, 60)
+        pg.draw.rect(surface, bgc, rect, border_radius=8)
+        pg.draw.rect(surface, border, rect, 2, border_radius=8)
+        if selected:
+            pg.draw.rect(surface, (255, 255, 255), rect, 3, border_radius=8)
+        ns = Skill._font_name.render(self.display_name, True, fc)
+        ds = Skill._font_desc.render(self.description,  True, dc)
+        surface.blit(ns, ns.get_rect(centerx=rect.centerx, y=rect.y + 9))
+        surface.blit(ds, ds.get_rect(centerx=rect.centerx, y=rect.y + 34))
+        return rect
+
+
+# ── SKILL MANAGER ─────────────────────────────────────────────────────────────
+class Skill_Manager:
+    def __init__(self, skills, surface):
+        self.skills  = skills
+        self.surface = surface
+
+    def get_by_name(self, name):
+        return self.skills.get(name)
+
+    def update_states(self, player_score, unlocked_set):
+        for skill in self.skills.values():
+            if skill.name in unlocked_set:
+                skill.state = "unlocked"
+            elif skill.is_available(player_score, unlocked_set):
+                skill.state = "available"
+            else:
+                skill.state = "locked"
+
+    def try_buy(self, skill, player, unlocked_set):
+        if not skill.is_available(player.score, unlocked_set):
+            return False
+        player.score -= skill.cost
+        skill.effect(player)
+        unlocked_set.add(skill.name)
+        skill.state = "unlocked"
+        return True
+
+    def update_positions(self, cx, cy):
+        for key, skill in self.skills.items():
+            ox, oy = SKILL_OFFSETS.get(key, (0, 0))
+            skill.pos = (cx + ox, cy + oy)
+
+    def draw_connections(self, scroll_x, scroll_y):
+        for skill in self.skills.values():
+            bx = skill.pos[0] + scroll_x
+            by = skill.pos[1] + scroll_y
+            for pname in skill.prereqs:
+                pre = self.get_by_name(pname)
+                if pre:
+                    ax = pre.pos[0] + scroll_x
+                    ay = pre.pos[1] + scroll_y
+                    active = pre.state == "unlocked" and skill.state != "locked"
+                    pg.draw.line(self.surface,
+                                 (140, 140, 140) if active else (48, 48, 58),
+                                 (ax, ay), (bx, by), 2)
+
+    def draw_all(self, selected_skill, scroll_x, scroll_y):
+        self.draw_connections(scroll_x, scroll_y)
+        rects = {}
+        for name, skill in self.skills.items():
+            rects[name] = skill.draw(self.surface, skill is selected_skill,
+                                     scroll_x, scroll_y)
+        return rects
+
+    def change_surface(self, surface):
+        self.surface = surface
+
+
+# ── BUILDER ───────────────────────────────────────────────────────────────────
+def build_skill_tree(cx, cy, surface):
+    skills = {}
+    for key, (display_name, desc, cost, prereqs, branch) in SKILL_DEFS.items():
+        ox, oy = SKILL_OFFSETS[key]
+        skills[key] = Skill(
+            name=key, display_name=display_name, description=desc,
+            cost=cost, prereqs=prereqs, branch_name=branch,
+            effect=SKILL_EFFECTS.get(key, lambda p: None),
+            pos=(cx + ox, cy + oy),
+            color=BRANCH_COLORS[branch],
+        )
+    return Skill_Manager(skills, surface)
+
+
+# ── PAUSE SCENE ───────────────────────────────────────────────────────────────
+class PauseScene(Scene):
+    def __init__(self, game: Game, previous_scene):
+        super().__init__(game)
+        self.prev_scene = previous_scene
+        self.manager    = UI_MANAGER(game.graphic2d_surf)
+        pg.event.set_grab(False)
+        pg.mouse.set_visible(True)
+        self.manager.add_element(Button, "RESUME",       on_click=self.resume,
+                                 alignment='CENTER_BOTH', y_offset=-120)
+        self.manager.add_element(Button, "SKILL TREE",   on_click=self.open_skill_tree,
+                                 alignment='CENTER_BOTH', y_offset=-40)
+        self.manager.add_element(Button, "QUIT TO MENU", on_click=self.quit,
+                                 alignment='CENTER_BOTH', y_offset=40,
+                                 ACTIVE_COLOR=(255, 100, 100))
+        self.font = pg.font.Font(None, 100)
+
+    def resume(self):
+        pg.event.set_grab(True)
+        pg.mouse.set_visible(False)
+        self.game.change_scene(self.prev_scene)
+
+    def open_skill_tree(self):
+        self.game.change_scene(SkillTreeScene(self.game, self))
+
+    def quit(self):
+        self.game.change_scene(StartScreen(self.game))
+
+    def handle_event(self, event):
+        if event.type == pg.KEYDOWN and event.key == pg.K_ESCAPE:
+            self.resume()
+        self.manager.handle_event(event)
+
+    def update(self):
+        self.manager.update()
+
+    def render(self):
+        self.prev_scene.render()
+        surf = self.game.graphic2d_surf
+        w, h = surf.get_size()
+        overlay = pg.Surface((w, h), pg.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        surf.blit(overlay, (0, 0))
+        txt = self.font.render("PAUSED", True, (255, 255, 255))
+        surf.blit(txt, txt.get_rect(center=(w//2, 100)))
+        self.manager.draw()
+        self.game.graphic3d.render_2d_surf(surf)
+
+    def resize(self, width, height):
+        self.prev_scene.resize(width, height)
+        self.manager.handle_resize(width, height, self.game.graphic2d_surf)
+
+
+# ── SKILL TREE SCENE ──────────────────────────────────────────────────────────
+class SkillTreeScene(Scene):
+    SCROLL_SPEED = 20
+    MAX_SCROLL_X = SX * 3 + 130
+    MAX_SCROLL_Y = int(SY * 4.8) + 90
+
+    def __init__(self, game: Game, pause_menu):
+        super().__init__(game)
+        self.pause_menu = pause_menu
+        if not hasattr(game.player, "unlocked_skills"):
+            game.player.unlocked_skills = {"root"}
+
+        self._btn_font = pg.font.Font(None, 28)
+        w, h = game.graphic2d_surf.get_size()
+        self.cx, self.cy   = w // 2, h // 2
+        self.skill_manager = build_skill_tree(self.cx, self.cy, game.graphic2d_surf)
+        self.selected   = None
+        self.node_rects = {}
+        self.scroll_x   = 0
+        self.scroll_y   = 0
+        self._drag_origin       = None
+        self._drag_scroll_start = None
+        self._font_hud     = pg.font.Font(None, 26)
+        self._font_label   = pg.font.Font(None, 30)
+        self._font_tooltip = pg.font.Font(None, 23)
+        self._btn_back   = pg.Rect(0, 0, 160, 44)
+        self._btn_center = pg.Rect(0, 0, 160, 44)
+        self._reposition_buttons(w, h)
+
+    def _reposition_buttons(self, w, h):
+        self._btn_back.center   = (w // 2 - 100, h - 38)
+        self._btn_center.center = (w // 2 + 100, h - 38)
+
+    def _draw_buttons(self, surf):
+        mouse = pg.mouse.get_pos()
+        for rect, label in ((self._btn_back, "GO BACK"), (self._btn_center, "CENTER VIEW")):
+            hovered = rect.collidepoint(mouse)
+            pg.draw.rect(surf, (80, 80, 95) if hovered else (45, 45, 58), rect, border_radius=8)
+            pg.draw.rect(surf, (160, 160, 180), rect, 2, border_radius=8)
+            txt = self._btn_font.render(label, True, (220, 220, 230))
+            surf.blit(txt, txt.get_rect(center=rect.center))
+
+    def go_back(self):
+        self.game.change_scene(self.pause_menu)
+
+    def center_view(self):
+        self.scroll_x = self.scroll_y = 0
+
+    def _clamp(self):
+        self.scroll_x = max(-self.MAX_SCROLL_X, min(self.MAX_SCROLL_X, self.scroll_x))
+        self.scroll_y = max(-self.MAX_SCROLL_Y, min(self.MAX_SCROLL_Y, self.scroll_y))
+
+    def handle_event(self, event):
+        if event.type == pg.KEYDOWN:
+            k = event.key
+            if   k == pg.K_ESCAPE: self.go_back()
+            elif k == pg.K_r:      self.center_view()
+            self._clamp()
+
+        elif event.type == pg.MOUSEWHEEL:
+            if pg.key.get_mods() & pg.KMOD_SHIFT:
+                self.scroll_x += event.y * self.SCROLL_SPEED
+            else:
+                self.scroll_y += event.y * self.SCROLL_SPEED
+            self._clamp()
+
+        elif event.type == pg.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                if self._btn_back.collidepoint(event.pos):
+                    self.go_back()
+                elif self._btn_center.collidepoint(event.pos):
+                    self.center_view()
+                elif self.selected:
+                    self.skill_manager.try_buy(self.selected, self.game.player,
+                                               self.game.player.unlocked_skills)
+            elif event.button == 2:
+                self._drag_origin       = event.pos
+                self._drag_scroll_start = (self.scroll_x, self.scroll_y)
+
+        elif event.type == pg.MOUSEBUTTONUP:
+            if event.button == 2:
+                self._drag_origin = None
+
+        elif event.type == pg.MOUSEMOTION:
+            if self._drag_origin:
+                dx = event.pos[0] - self._drag_origin[0]
+                dy = event.pos[1] - self._drag_origin[1]
+                if self._drag_scroll_start is not None:
+                    self.scroll_x = self._drag_scroll_start[0] + dx
+                    self.scroll_y = self._drag_scroll_start[1] + dy
+                self._clamp()
+            self.selected = None
+            for name, rect in self.node_rects.items():
+                if rect.collidepoint(event.pos):
+                    self.selected = self.skill_manager.get_by_name(name)
+                    break
+
+    def update(self):
+        keys = pg.key.get_pressed()
+        if keys[pg.K_LEFT]:  self.scroll_x += self.SCROLL_SPEED
+        if keys[pg.K_RIGHT]: self.scroll_x -= self.SCROLL_SPEED
+        if keys[pg.K_UP]:    self.scroll_y += self.SCROLL_SPEED
+        if keys[pg.K_DOWN]:  self.scroll_y -= self.SCROLL_SPEED
+        self._clamp()
+        self.skill_manager.update_states(self.game.player.score,
+                                         self.game.player.unlocked_skills)
+
+    def _draw_labels(self, surf):
+        for text, ox, oy, color in BRANCH_LABELS:
+            x = self.cx + ox + self.scroll_x
+            y = self.cy + oy + self.scroll_y
+            s = self._font_label.render(text, True, color)
+            surf.blit(s, s.get_rect(center=(x, y)))
+
+    def _draw_tooltip(self, surf):
+        sk = self.selected
+        if sk is None:
+            return
+        lines = [
+            (sk.display_name,           BRANCH_COLORS[sk.branch_name]),
+            (sk.description,            (200, 200, 210)),
+            (f"Cost: {sk.cost} pts",    (180, 180, 190)),
+            (f"Status: {sk.state.upper()}", (160, 160, 170)),
+        ]
+        if sk.prereqs:
+            lines.append((f"Needs: {', '.join(sk.prereqs)}", (140, 140, 150)))
+        pad, lh, bw = 10, 22, 270
+        bh = len(lines) * lh + pad * 2
+        mx, my = pg.mouse.get_pos()
+        bx = min(mx + 16, surf.get_width()  - bw - 4)
+        by = min(my + 16, surf.get_height() - bh - 4)
+        bg = pg.Surface((bw, bh), pg.SRCALPHA)
+        bg.fill((12, 12, 22, 225))
+        surf.blit(bg, (bx, by))
+        pg.draw.rect(surf, BRANCH_COLORS[sk.branch_name], (bx, by, bw, bh), 1, border_radius=6)
+        for i, (line, color) in enumerate(lines):
+            surf.blit(self._font_tooltip.render(line, True, color),
+                      (bx + pad, by + pad + i * lh))
+
+    def _draw_hud(self, surf):
+        hints = [
+            f"Score: {self.game.player.score} pts",
+            "Gold border = buyable  |  Click to unlock",
+            "Scroll: Wheel / Arrows  |  MMB drag  |  R = recenter",
+        ]
+        for i, h in enumerate(hints):
+            surf.blit(self._font_hud.render(h, True, (150, 150, 170)), (12, 10 + i * 22))
+
+    def render(self):
+        surf = self.game.graphic2d_surf
+        surf.fill((16, 18, 28))
+        self._draw_labels(surf)
+        self.node_rects = self.skill_manager.draw_all(self.selected,
+                                                      self.scroll_x, self.scroll_y)
+        self._draw_tooltip(surf)
+        self._draw_hud(surf)
+        self._draw_buttons(surf)
+        self.game.graphic3d.render_2d_surf(surf)
+
+    def resize(self, width, height):
+        self.pause_menu.resize(width, height)
+        self.cx, self.cy = width // 2, height // 2
+        self.skill_manager.update_positions(self.cx, self.cy)
+        self.skill_manager.change_surface(self.game.graphic2d_surf)
+        self._reposition_buttons(width, height)
+
+============================================================
+SOURCE FILE: piece_points.py
+============================================================
+
+import numpy as np
+
+PIECE_VALUES = np.array([
+    [0, 0],          # 0: Empty
+    [82, 94],        # 1: Pawn
+    [337, 281],      # 2: Knight
+    [365, 297],      # 3: Bishop
+    [477, 512],      # 4: Rook
+    [1025, 936],     # 5: Queen
+    [0, 0]           # 6: King 
+], dtype=np.int32)
+
+PAWN_TABLE_START_GAME = np.array([
+      0,   0,   0,   0,   0,   0,  0,   0,
+     98, 134,  61,  95,  68, 126, 34, -11,
+     -6,   7,  26,  31,  65,  56, 25, -20,
+    -14,  13,   6,  21,  23,  12, 17, -23,
+    -27,  -2,  -5,  12,  17,   6, 10, -25,
+    -26,  -4,  -4, -10,   3,   3, 33, -12,
+    -35,  -1, -20, -23, -15,  24, 38, -22,
+      0,   0,   0,   0,   0,   0,  0,   0
+], dtype=np.int32)
+
+PAWN_TABLE_END_GAME = np.array([
+      0,   0,   0,   0,   0,   0,   0,   0,
+    178, 173, 158, 134, 147, 132, 165, 187,
+     94, 100,  85,  67,  56,  53,  82,  84,
+     32,  24,  13,   5,  -2,   4,  17,  17,
+     13,   9,  -3,  -7,  -7,  -8,   3,  -1,
+      4,   7,  -6,   1,   0,  -5,  -1,  -8,
+     13,   8,   8,  10,  13,   0,   2,  -7,
+      0,   0,   0,   0,   0,   0,   0,   0
+], dtype=np.int32)
+
+KNIGHT_TABLE_START_GAME = np.array([
+    -167, -89, -34, -49,  61, -97, -15, -107,
+     -73, -41,  72,  36,  23,  62,   7,  -17,
+     -47,  60,  37,  65,  84, 129,  73,   44,
+      -9,  17,  19,  53,  37,  69,  18,   22,
+     -13,   4,  16,  13,  28,  19,  21,   -8,
+     -23,  -9,  12,  10,  19,  17,  25,  -16,
+     -29, -53, -12,  -3,  -1,  18, -14,  -19,
+    -105, -21, -58, -33, -17, -28, -19,  -23
+], dtype=np.int32)
+
+KNIGHT_TABLE_END_GAME = np.array([
+    -58, -38, -13, -28, -31, -27, -63, -99,
+    -25,  -8, -25,  -2,  -9, -25, -24, -52,
+    -24, -20,  10,   9,  -1,  -9, -19, -41,
+    -17,   3,  22,  22,  22,  11,   8, -18,
+    -18,  -6,  16,  25,  16,  17,   4, -18,
+    -23,  -3,  -1,  15,  10,  -3, -20, -22,
+    -42, -20, -10,  -5,  -2, -20, -23, -44,
+    -29, -51, -23, -15, -22, -18, -50, -64
+], dtype=np.int32)
+
+BISHOP_TABLE_START_GAME = np.array([
+    -29,   4, -82, -37, -25, -42,   7,  -8,
+    -26,  16, -18, -13,  30,  59,  18, -47,
+    -16,  37,  43,  40,  35,  50,  37,  -2,
+     -4,   5,  19,  50,  37,  37,   7,  -2,
+     -6,  13,  13,  26,  34,  12,  10,   4,
+      0,  15,  15,  15,  14,  27,  18,  10,
+      4,  15,  16,   0,   7,  21,  33,   1,
+    -33,  -3, -14, -21, -13, -12, -39, -21
+], dtype=np.int32)
+
+BISHOP_TABLE_END_GAME = np.array([
+    -14, -21, -11,  -8, -7,  -9, -17, -24,
+     -8,  -4,   7, -12, -3, -13,  -4, -14,
+      2,  -8,   0,  -1, -2,   6,   0,   4,
+     -3,   9,  12,   9, 14,  10,   3,   2,
+     -6,   3,  13,  19,  7,  10,  -3,  -9,
+    -12,  -3,   8,  10, 13,   3,  -7, -15,
+    -14, -18,  -7,  -1,  4,  -9, -15, -27,
+    -23,  -9, -23,  -5, -9, -16,  -5, -17
+], dtype=np.int32)
+
+ROOK_TABLE_START_GAME = np.array([
+     32,  42,  32,  51, 63,  9,  31,  43,
+     27,  32,  58,  62, 80, 67,  26,  44,
+     -5,  19,  26,  36, 17, 45,  61,  16,
+    -24, -11,   7,  26, 24, 35,  -8, -20,
+    -36, -26, -12,  -1,  9, -7,   6, -23,
+    -45, -25, -16, -17,  3,  0,  -5, -33,
+    -44, -16, -20,  -9, -1, 11,  -6, -71,
+    -19, -13,   1,  17, 16,  7, -37, -26
+], dtype=np.int32)
+
+ROOK_TABLE_END_GAME = np.array([
+    13, 10, 18, 15, 12,  12,   8,   5,
+    11, 13, 13, 11, -3,   3,   8,   3,
+     7,  7,  7,  5,  4,  -3,  -5,  -3,
+     4,  3, 13,  1,  2,   1,  -1,   2,
+     3,  5,  8,  4, -5,  -6,  -8, -11,
+    -4,  0, -5, -1, -7, -12,  -8, -16,
+    -6, -6,  0,  2, -9,  -9, -11,  -3,
+    -9,  2,  3, -1, -5, -13,   4, -20
+], dtype=np.int32)
+
+QUEEN_TABLE_START_GAME = np.array([
+    -28,   0,  29,  12,  59,  44,  43,  45,
+    -24, -39,  -5,   1, -16,  57,  28,  54,
+    -13, -17,   7,   8,  29,  56,  47,  57,
+    -27, -27, -16, -16,  -1,  17,  -2,   1,
+     -9, -26,  -9, -10,  -2,  -4,   3,  -3,
+    -14,   2, -11,  -2,  -5,   2,  14,   5,
+    -35,  -8,  11,   2,   8,  15,  -3,   1,
+     -1, -18,  -9,  10, -15, -25, -31, -50
+], dtype=np.int32)
+
+QUEEN_TABLE_END_GAME = np.array([
+     -9,  22,  22,  27,  27,  19,  10,  20,
+    -17,  20,  32,  41,  58,  25,  30,   0,
+    -20,   6,   9,  49,  47,  35,  19,   9,
+      3,  22,  24,  45,  57,  40,  57,  36,
+    -18,  28,  19,  47,  31,  34,  39,  23,
+    -16, -27,  15,   6,   9,  17,  10,   5,
+    -22, -23, -30, -16, -16, -23, -36, -32,
+    -33, -28, -22, -43,  -5, -32, -20, -41
+], dtype=np.int32)
+
+KING_TABLE_START_GAME = np.array([
+    -65,  23,  16, -15, -56, -34,   2,  13,
+     29,  -1, -20,  -7,  -8,  -4, -38, -29,
+     -9,  24,   2, -16, -20,   6,  22, -22,
+    -17, -20, -12, -27, -30, -25, -14, -36,
+    -49,  -1, -27, -39, -46, -44, -33, -51,
+    -14, -14, -22, -46, -44, -30, -15, -27,
+      1,   7,  -8, -64, -43, -16,   9,   8,
+    -15,  36,  12, -54,   8, -28,  24,  14
+], dtype=np.int32)
+
+KING_TABLE_END_GAME = np.array([
+    -74, -35, -18, -18, -11,  15,   4, -17,
+    -12,  17,  14,  17,  17,  38,  23,  11,
+     10,  17,  23,  15,  20,  45,  44,  13,
+     -8,  22,  24,  27,  26,  33,  26,   3,
+    -18,  -4,  21,  24,  27,  23,   9, -11,
+    -19,  -3,  11,  21,  23,  16,   7,  -9,
+    -27, -11,   4,  13,  14,   4,  -5, -17,
+    -53, -34, -21, -11, -28, -14, -24, -43
+], dtype=np.int32)
+
+
+piece_square_mid_game = np.zeros((15, 64), dtype=np.int32)
+piece_square_end_game = np.zeros((15, 64), dtype=np.int32)
+
+white_mid_game = [None, PAWN_TABLE_START_GAME, KNIGHT_TABLE_START_GAME, BISHOP_TABLE_START_GAME, ROOK_TABLE_START_GAME, QUEEN_TABLE_START_GAME, KING_TABLE_START_GAME]
+white_end_game = [None, PAWN_TABLE_END_GAME, KNIGHT_TABLE_END_GAME, BISHOP_TABLE_END_GAME, ROOK_TABLE_END_GAME, QUEEN_TABLE_END_GAME, KING_TABLE_END_GAME]
+
+for p_type in range(1, 7):
+    val_mid_game = PIECE_VALUES[p_type][0]
+    val_end_game = PIECE_VALUES[p_type][1]
+    
+    # White Tables
+    piece_square_mid_game[p_type] = (val_mid_game + white_mid_game[p_type])
+    piece_square_end_game[p_type] = (val_end_game + white_end_game[p_type])
+    
+    # Black Tables
+    piece_square_mid_game[p_type + 8] = -(val_mid_game + white_mid_game[p_type][::-1])
+    piece_square_end_game[p_type + 8] = -(val_end_game + white_end_game[p_type][::-1])
+
+# PHASE WEIGHTS
+PHASE_WEIGHTS = np.array([0, 0, 1, 1, 2, 4, 0, 0, 0, 0, 1, 1, 2, 4, 0], dtype=np.int32)
+
+============================================================
+SOURCE FILE: player.py
+============================================================
+
+import pygame as pg
+import numpy as np
+import math
+
+class Waypoint:
+    """A named map marker.  label is a single display char: 'H', 'P', '1', '2' …"""
+    def __init__(self, label: str, grid_r: int, grid_c: int):
+        self.label  = label
+        self.grid_r = grid_r
+        self.grid_c = grid_c
+
+class Player:
+    def __init__(self, start_pos, surface=None, radius=0.3):
+        self.pos = np.array(start_pos, dtype=np.float32)
+        self.playing_chess = False
+        self.speed = 0.1
+        self.radius = radius
+        self.dragons_beaten = 0
+
+        self.lives = 3
+        self.score = 10000000
+        
+        self.can_move = True
+        self.angle_x = 0.0
+        self.angle_y = 0.0
+        self.mouse_sensitivity = 0.002
+        
+        self.chance_of_chess = 0.5
+        self.chess_difficulty, self.fps_difficulty = 0, 0
+        self.time_limit_of_AI = 0 
+        self.time_limit_of_fps = 0 
+        self.fps_block_speed_multiplier = 1.0
+        self.fps_block_size_multiplier = 1.0
+
+        self.vision_range = 5
+        self.minimap_radius_bonus = 1.0
+        self.unlocked_skills = {"root"}
+        # skill flags — checked by game logic when relevant
+        # ── Sentinel (Chess) ──────────────────────────
+        self.pawn_shield     = False   # +1 pawn at start
+        self.royal_guard     = False   # pawn → Queen
+        self.ai_fatigue      = False   # AI depth -2 per 5 moves
+        self.dragons_blunder = False   # AI picks 3rd best move
+        self.blitz_specialist= False   # win <20 moves = 2× pts
+        self.berserker_king  = False   # King also moves as Knight
+ 
+        # ── Guardian (Defense) ────────────────────────
+        self.peace_treaty    = False   # stalemates safe
+        self.soft_landing    = False   # lose → 5 tiles from portal
+        self.second_wind     = False   # revive once at 0 lives
+        self._second_wind_used = False # internal — resets each run
+        self.kings_ransom    = False   # spend 500 pts to survive
+ 
+        # ── Explorer (Utility) ────────────────────────
+        self.speedster       = False   # Shift = 2× speed
+        self.extra_spoils    = False   # +25% battle score
+ 
+        # ── Seer (Navigation) ─────────────────────────
+        self.beacon           = False   # unlocks waypoint system
+        self.home_beacon      = False   # H key → home waypoint
+        self.portal_beacon    = False   # P key → nearest portal waypoint
+        self.multi_beacon     = False   # raises max_waypoints to 3
+        self.boss_tracker     = False   # boss dot after 2 kills
+        self.clarity          = False   # no fog
+        self.gps              = False   # full maze on minimap
+        self.warp             = False   # teleport to boss once
+        self.teleport_to_end_available = True
+
+        self.portal_tower = False
+ 
+        # Waypoints dict: label → Waypoint  (e.g. 'H', 'P', '1', '2', '3')
+        self.waypoints     = {}
+        self.max_waypoints = 1      # raised by multi_beacon (→3)
+
+    def set_named_waypoint(self, label: str, grid_r: int, grid_c: int):
+        if label in self.waypoints:
+            del self.waypoints[label]
+        else:
+            self.waypoints[label] = Waypoint(label, grid_r, grid_c)
+
+    def place_custom_waypoint(self, grid_r: int, grid_c: int):
+        labels = [str(i) for i in range(1, self.max_waypoints + 1)]
+        for lbl in labels:
+            if lbl in self.waypoints:
+                wp = self.waypoints[lbl]
+                if wp.grid_r == grid_r and wp.grid_c == grid_c:
+                    del self.waypoints[lbl]
+                    return
+        
+        for lbl in labels:
+            if lbl not in self.waypoints:
+                self.waypoints[lbl] = Waypoint(lbl, grid_r, grid_c)
+                return
+        
+        del self.waypoints[labels[0]]
+        self.waypoints[labels[0]] = Waypoint(labels[0], grid_r, grid_c)
+    
+    def nearest_portal(self, grid) -> tuple | None:
+        portals = np.argwhere(grid == 3)
+        if len(portals) == 0: return None
+
+        px, py = float(self.pos[0]), float(self.pos[1])
+        best_d, best_r, best_c  = float('-inf'), None, None
+
+        for pos in portals:
+            r, c = int(pos[0]), int(pos[1])
+            d = math.hypot(c - px, r - py)
+            if d < best_d:
+                best_d, best_r, best_c = d, r, c
+            return(best_r, best_c) if best_r is not None else None
+
+
+        
+    def angle_mouse(self):
+        x, y = pg.mouse.get_rel()
+        self.angle_x += x * self.mouse_sensitivity
+        self.angle_y -= y * self.mouse_sensitivity
+        self.angle_y = np.clip(self.angle_y, -np.pi / 2, np.pi / 2)
+
+    def update(self, keys, grid, delta_time = 0.016):
+        self.angle_mouse()
+        sin_a = np.sin(self.angle_x)
+        cos_a = np.cos(self.angle_x)
+
+        speed = self.speed
+        if self.speedster and keys[pg.K_LSHIFT]:
+            speed = speed * 2
+        actual_speed = (speed * 60.0) * delta_time
+
+        delta_x = 0.0
+        delta_z = 0.0
+        if self.can_move:
+            if keys[pg.K_w] or keys[pg.K_UP]:
+                delta_x += actual_speed * cos_a
+                delta_z += actual_speed * sin_a
+            if keys[pg.K_s] or keys[pg.K_DOWN]:
+                delta_x -= actual_speed * cos_a
+                delta_z -= actual_speed * sin_a
+            if keys[pg.K_a] or keys[pg.K_LEFT]:
+                delta_x += actual_speed * sin_a
+                delta_z -= actual_speed * cos_a
+            if keys[pg.K_d] or keys[pg.K_RIGHT]:
+                delta_x -= actual_speed * sin_a
+                delta_z += actual_speed * cos_a
+
+            if delta_x != 0.0 and delta_z != 0.0:
+                length = np.hypot(delta_x, delta_z)
+                delta_x = delta_x / length
+                delta_z = delta_z / length
+                delta_x *= actual_speed
+                delta_z *= actual_speed
+
+        self.collision_checker(delta_x, delta_z, grid)
+
+    def collision_checker(self, dx, dz, grid):
+        """"""
+        rows, cols = grid.shape
+
+        to_be_x = self.pos[0] + dx
+        n_x = int(np.clip(to_be_x + np.sign(dx) * self.radius, 0, cols - 1))
+        n_y = int(np.clip(self.pos[1], 0, rows - 1))
+
+        if grid[n_y, n_x] != 1:
+            self.pos[0] = to_be_x
+
+        to_be_z = self.pos[1] + dz
+        n_x = int(np.clip(self.pos[0], 0, cols - 1))
+        n_y = int(np.clip(to_be_z + np.sign(dz) * self.radius, 0, rows - 1))
+
+        if grid[n_y, n_x] != 1:
+            self.pos[1] = to_be_z
+
+    def check_teleports(self, grid, portal_dict):
+        rows, cols = grid.shape
+        r = int(np.clip(self.pos[1], 0, rows - 1))
+        c = int(np.clip(self.pos[0], 0, cols - 1))
+
+        if grid[r, c] == 3:
+            self.speed = 0
+            self.playing_chess = True
+            pg.mouse.get_rel()
+
+============================================================
+SOURCE FILE: requirments.py
+============================================================
+
+def requirments():
+    import subprocess
+    import sys
+    import importlib
+    REQUIRED_MAJOR, REQUIRED_MINOR = 3,13
+    if sys.version_info.major != REQUIRED_MAJOR or sys.version_info.minor != REQUIRED_MINOR:
+        print(f"ERROR: This project requires Python {REQUIRED_MAJOR}.{REQUIRED_MINOR}.")
+        print(f"You are currently running Python {sys.version_info.major}.{sys.version_info.minor}.")
+        print(f"Due, to this, they may be errors or problems in the game.")
+        print(f"Please double check the version and ensure the proper version of py is being run.")
+        print(f"Thank you. The program will try to run now, but, again, issues may result from such errors.")
+
+    go_ahead_for_game = True
+    packages = {
+        "pygame": "pygame",
+        "numba": "numba",
+        "numpy": "numpy",
+        "moderngl": "moderngl",
+        "pyrr": "pyrr",
+        "moderngl_window": "moderngl-window"
+    }
+    for module_name, pip_name in packages.items():
+        try:
+            importlib.import_module(module_name)
+        except:
+            go_ahead_for_game = False
+    if go_ahead_for_game:
+        print("Hello, as you have all libraries installed for the game, the game will proceed.")
+    if not go_ahead_for_game:
+        starter_text = f"""Greetings:
+There are several libraries required for this project to run successfully.
+If you wish, the packages can be installed right now (if they are not already).
+You have to allow this to run the project, but you will be give the choice below.
+Here are the libraries needed: \n{"\n".join([f"-{package}" for package in packages.keys()])}."""
+        print(starter_text)
+        choice = str(input("Type no to stop else it will run, or press enter/anything else to continue: ")).strip().lower()
+        if choice == "no":
+            sys.exit()
+
+        for module_name, pip_name in packages.items():
+            try:
+                importlib.import_module(module_name)
+                print(f"{pip_name} already installed")
+            except ImportError:
+                print(f"Installing {pip_name}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+
+        print("All required libraries are installed.")
+
+============================================================
+SOURCE FILE: scene.py
+============================================================
+
+from game import Game
+class Scene:
+    def __init__(self, game):
+        self.game: Game = game
+    
+    def handle_event(self, event):
+        pass
+
+    def update(self):
+        pass
+
+    def render(self):
+        pass
+    def handle_resize(self):
+        pass
+
+============================================================
+SOURCE FILE: taming_scene3.py
+============================================================
+
+import pygame as pg
+import numpy as np
+import math
+import time
+import random
+import moderngl as mgl
+ 
+from pyrr import matrix44
+from scene import Scene
+import constants
+from menu_scenes import EndScreen
+
+class Net:
+    def __init__(self, start_pos, direction, difficulty: float=0.0):
+        self.start_pos = np.array(start_pos, dtype=np.float32)
+        self.pos = np.array(start_pos, dtype=np.float32)
+        self.direction = direction
+        self.difficulty = (1-difficulty)
+        self.speed = 1.0 + (difficulty * 1)
+        self.velocity = np.array(self.direction, dtype=np.float32) * self.speed
+        self.gravity = 0.01
+        self.active = True
+        self.life_time = 150
+        self.radius = 0.3
+ 
+    def update(self):
+        if self.active:
+            self.velocity[1] -= 0.01
+            self.pos += self.velocity
+            distance = abs(np.linalg.norm(self.pos - self.start_pos))
+            if (distance > 2000) or (self.life_time <= 0) or (self.pos[1] < -15.0):
+                self.active=False
+            self.life_time -= 1
+   
+    def check_collision(self, targets):
+        
+        hit_idxs = []
+        target_found = False
+        for i, target in enumerate(targets):
+            if target.captured: continue
+            half_width = target.width / 2
+            half_z_depth = target.z_depth / 2
+
+            min_x, max_x = target.pos[0] + target.hitbox_min[0], target.pos[0] + target.hitbox_max[0]
+            min_y, max_y = target.pos[1] + target.hitbox_min[1], target.pos[1] + target.hitbox_max[1]
+            min_z, max_z = target.pos[2] + target.hitbox_min[2], target.pos[2] + target.hitbox_max[2]
+
+            if (
+                min_x - self.radius <= self.pos[0] <= max_x + self.radius and
+                min_y - self.radius <= self.pos[1] <= max_y + self.radius and
+                min_z - self.radius <= self.pos[2] <= max_z + self.radius
+               ):
+                hit_idxs.append(i)
+                target_found = True
+        if target_found:
+            return True, None, hit_idxs
+        return False, None, None
+ 
+class Target:
+    def __init__(self, ctx, program, name, pos, hitbox_mul, color, fmt='3f', size=1.0, attribute_names=['in_pos'],  vbo=None):
+        self.name = name
+        self.max_hp = 3 if self.name == 'King' else (2 if self.name == 'Queen' else 1)
+        self.hp = self.max_hp
+        self.pos = np.array(pos, dtype='float32')
+        self.hitbox_mul = hitbox_mul
+        self.color = color
+        self.captured = False
+        self.program = program
+        self.size = size
+        self.vbo = vbo
+        self.hitbox_min = self.hitbox_max = 0
+        if self.vbo is None:
+            vertices = np.array([
+            -self.size, -self.size,  self.size,  self.size, -self.size,  self.size,  self.size,  self.size,  self.size, # Front
+            -self.size, -self.size,  self.size,  self.size,  self.size,  self.size, -self.size,  self.size,  self.size,
+            self.size, -self.size,  self.size,  self.size, -self.size, -self.size,  self.size,  self.size, -self.size, # Right
+            self.size, -self.size,  self.size,  self.size,  self.size, -self.size,  self.size,  self.size,  self.size,
+            self.size, -self.size, -self.size, -self.size, -self.size, -self.size, -self.size,  self.size, -self.size, # Back
+            self.size, -self.size, -self.size, -self.size,  self.size, -self.size,  self.size,  self.size, -self.size,
+            -self.size, -self.size, -self.size, -self.size, -self.size,  self.size, -self.size,  self.size,  self.size, # Left
+            -self.size, -self.size, -self.size, -self.size,  self.size,  self.size, -self.size,  self.size, -self.size,
+            -self.size,  self.size,  self.size,  self.size,  self.size,  self.size,  self.size,  self.size, -self.size, # Top
+            -self.size,  self.size,  self.size,  self.size,  self.size, -self.size, -self.size,  self.size, -self.size,
+            -self.size, -self.size, -self.size,  self.size, -self.size, -self.size,  self.size, -self.size,  self.size, # Bottom
+            -self.size, -self.size, -self.size,  self.size, -self.size,  self.size, -self.size, -self.size,  self.size,
+            ], dtype='float32')
+        else:
+            vertices = vbo.astype('float32') * 10.0 # type: ignore
+        self.vbo = ctx.buffer(vertices)
+        self.vao = ctx.vertex_array(program, [(self.vbo, fmt, *attribute_names)])
+
+        self.hitbox_builder(vertices)
+   
+    def render(self):
+        if not self.captured:
+            scale_mat = matrix44.create_from_scale(
+                np.array([self.size, self.size, self.size], dtype='float32')
+            )
+            trans_mat = matrix44.create_from_translation(self.pos)
+            model = matrix44.multiply(scale_mat, trans_mat)
+            self.program["m_model"].write(model.astype("float32"))
+            self.program["u_color"].value = self.color
+            self.vao.render()
+    
+    def hitbox_builder(self, vertices):
+        vbo = np.array(vertices)
+        if vbo is not None:
+            shaped_vbo: np.ndarray = vbo.reshape(-1, 3)
+            self.vbo_min = np.min(shaped_vbo, axis=0)
+            self.vbo_max = np.max(shaped_vbo, axis=0)
+
+            self.width = (self.vbo_max[0] - self.vbo_min[0])  * self.size
+            self.height = (self.vbo_max[1] - self.vbo_min[1]) * self.size
+            self.z_depth = (self.vbo_max[2] - self.vbo_min[2])* self.size
+            
+            self.hitbox_min, self.hitbox_max = self.vbo_min * self.size, self.vbo_max * self.size
+            self.hitbox_center = ((self.vbo_max + self.vbo_min)/2) * self.size
+
+        else:
+            self.width = self.height = self.depth = self.size * 2
+            self.hitbox_min = np.array([-self.size, 0.0, -self.size])
+            self.hitbox_max = np.array([self.size, self.size * 2, self.size])
+            self.hitbox_center = np.array([0.0, self.size, 0.0])
+
+class TamingScene(Scene):
+    def __init__(self, game, is_boss=False):
+        WIDTH = constants.WIDTH
+        HEIGHT = constants.HEIGHT
+        super().__init__(game)
+        pg.mouse.set_visible(False)
+        pg.event.set_grab(True)
+        self.is_boss = is_boss
+        
+        self.time_limit = float(self.game.player.time_limit_of_fps) + 9.0 
+        if not (self.time_limit > 0.0): self.time_limit = 20.0
+       
+        self.distance_extra_x = 1.0 if not is_boss else 2.0
+        self.distance_extra_y = -1.0 if not is_boss else 2.0
+        self.distance_extra_z = 1.0 if not is_boss else 2.0
+ 
+        self.dragon_level = 1.0 if not is_boss else 1.5
+        self.size = 0.90
+        self.speed_mul = self.game.player.fps_block_speed_multiplier * self.dragon_level
+       
+        self.start_time = time.time()
+        self.nets = []
+        self.yaw = math.pi / 2.0
+        self.pitch = 0.0
+        self.camera_front = np.array([0.0, 0.0, 1.0], dtype='float32')
+        self.mouse_sensitivity: float = 0.002
+        self.targets: dict = {}
+        self.over_processed: bool = False
+
+        self.pieces_defeated: int = 0
+ 
+        self.hitbox_show: bool = False
+        self.hitbox_vbo = self.game.graphic3d.ctx.buffer(self.game.graphic3d._cube_data())
+        self.hitbox_vao = self.game.graphic3d.ctx.simple_vertex_array(self.game.graphic3d.prog, self.hitbox_vbo, "in_pos")
+ 
+        try:
+            from vbo_folder.vbo import QUEEN_VBO, KING_VBO, ROOK_VBO
+        except ImportError:
+            print("VBOs not found.")
+            ROOK_VBO, KING_VBO, QUEEN_VBO = None, None, None
+ 
+        self.targets["Rook"]=Target(ctx=self.game.graphic3d.ctx,
+                                program=self.game.graphic3d.prog,
+                                name="Rook",
+                                pos=[-5.0 + self.distance_extra_x, 0.0 + self.distance_extra_y, 20.0+self.distance_extra_z],
+                                hitbox_mul=self.size,
+                                color=(0.0, 0.5, 1.0),
+                                fmt='3f',
+                                size=self.size,
+                                attribute_names=['in_pos'],
+                                vbo=ROOK_VBO
+                            )
+ 
+        self.targets["Queen"] = Target(
+                                ctx=self.game.graphic3d.ctx,
+                                program=self.game.graphic3d.prog,
+                                name="Queen",
+                                pos=[5.0 + self.distance_extra_x, 2.0 + self.distance_extra_y, 25.0+self.distance_extra_z],
+                                hitbox_mul=self.size,
+                                color=(1.0, 0.0, 1.0),
+                                fmt='3f',
+                                size=self.size,
+                                attribute_names=['in_pos'],
+                                vbo=QUEEN_VBO
+                            )
+ 
+        self.targets["King"] = Target(
+                                ctx=self.game.graphic3d.ctx,
+                                program=self.game.graphic3d.prog,
+                                name="King",
+                                pos=[0.0 + self.distance_extra_x, 0.0 + self.distance_extra_y, 30.0+self.distance_extra_z],
+                                hitbox_mul=self.size,
+                                color=(1.0, 0.8, 0.0),
+                                fmt='3f',
+                                size=self.size,
+                                attribute_names=['in_pos'],
+                                vbo=KING_VBO
+                            )
+       
+        self.update_cam()
+        self.dir_target = 1
+
+    def update_cam(self):
+        x = math.cos(self.yaw) * math.cos(self.pitch)
+        y = math.sin(self.pitch)
+        z = math.sin(self.yaw) * math.cos(self.pitch)
+        self.camera_front = np.array([x, y, z], dtype='float32')
+        self.camera_front /= np.linalg.norm(self.camera_front)
+        eye = np.array([0.0, 0.0, 0.0], dtype='float32')
+        up = np.array([0.0, 1.0, 0.0], dtype='float32')
+        self.view = matrix44.create_look_at(eye, eye + self.camera_front, up)
+                                           
+    def handle_event(self, event):
+        if event.type == pg.MOUSEMOTION:
+            dx, dy = event.rel
+            self.yaw += dx * self.mouse_sensitivity
+            self.pitch -= dy * self.mouse_sensitivity
+            self.pitch = max(-math.pi/2 + 0.1, min(math.pi/2 - 0.1, self.pitch))
+
+        elif event.type == pg.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self.shoot_net()
+        elif event.type == pg.KEYDOWN:
+            if event.key == pg.K_ESCAPE:
+                pg.event.set_grab(not pg.event.get_grab())
+                pg.mouse.set_visible(not pg.mouse.get_visible())
+            if event.key == pg.K_q:
+                self.finish_taming(victory=False, pieces_defeated=self.pieces_defeated)
+            if (event.key == pg.K_F2) or (event.key == pg.K_h):
+                self.hitbox_show = not self.hitbox_show
+   
+    def shoot_net(self):
+        net = Net([0.0, 0.0, 0.0], self.camera_front.copy(), difficulty=self.game.player.fps_difficulty)
+        self.nets.append(net)
+   
+    def update(self):
+        self.update_cam()
+
+        time_left = max(0, self.time_limit - (time.time() - self.start_time))
+        theta = time.time() * (1 + self.dragon_level*self.speed_mul)
+        if abs(time_left % 100.0) < 0.1:
+            self.dir_target = random.choice([1,-1])*self.dir_target
+
+        rook, queen, king = self.targets["Rook"], self.targets["Queen"], self.targets["King"]
+
+        rook_radius = 12.0
+        if not rook.captured:
+            radius = rook_radius
+            y_incr = random.choice([0, 0.1]) if random.random() < 0.1 else 0
+            rook.pos = np.array([radius * math.cos(theta), # X
+                                 -1.0 + (y_incr),           # Y
+                                 radius * math.sin(theta)])# Z
+        if not queen.captured:
+            radius = rook_radius + 6.0
+            queen.pos = np.array([radius * math.cos(theta * 1.5), # X
+                                  1.0 + (0.3 * math.cos(theta * 1.8)),# Y
+                                  radius * math.sin(theta)])      # Z
+        if not king.captured:
+            radius = rook_radius + 12.0
+            king.pos = np.array([radius * math.cos(theta), # X
+                                3.0 + (2.1 * math.cos(theta * 2.8)),# Y
+                                radius * math.sin(theta)]) # Z
+       
+        for net in self.nets[:]:
+            net.update()
+            
+            target_list = list(self.targets.values())
+            hit_bool, hit_pos, hit_indices = net.check_collision(target_list)
+ 
+            if hit_bool and net.active:
+                net.active = False
+                for idx in hit_indices:
+                    target_obj = target_list[idx]
+                    if not target_obj.captured:
+                        target_obj.hp -= 1
+                        self.pieces_defeated += 1
+                        if target_obj.hp <= 0:
+                            target_obj.captured = True
+                            print(f"Captured the {target_obj.name}")
+                        else:
+                            health_percent = target_obj.hp / target_obj.max_hp
+                            red = 0.19 + (health_percent * 0.81)
+                            target_obj.color = (red, 0.0, 0.0)
+                            target_obj.pos[1] += 1.0
+
+            if not net.active or net.life_time <= 0:
+                if net in self.nets:
+                    self.nets.remove(net)
+ 
+            all_captured = all(target.captured for target in self.targets.values())
+            if all_captured:
+                self.finish_taming(victory=True, pieces_defeated=self.pieces_defeated)
+            elif time_left <= 0:
+                self.finish_taming(victory=False, pieces_defeated=self.pieces_defeated)
+ 
+    def finish_taming(self, victory, pieces_defeated):
+        if self.over_processed: return
+        for target in self.targets.values():
+            target.vbo.release()
+            target.vao.release()
+        
+        self.game.player.score += (pieces_defeated * (10*self.game.player.fps_difficulty))
+
+        if victory:
+            print("One Dragon Tamed!")
+            self.game.player.dragons_beaten += 1
+            self.game.player.score += (100 + (100 * self.game.player.fps_difficulty))
+            if self.is_boss:
+                    pg.event.set_grab(False)
+                    pg.mouse.set_visible(True)
+                    self.game.change_scene(EndScreen(self.game, victory=True))
+                    return
+            r, c = self.game.current_battle_pos                
+            self.game.grid[r, c] = 0
+        else:
+            print("Time ran out! You lost a life.")
+            self.game.player.lives -= 1
+            if self.game.player.lives <= 0:
+                pg.event.set_grab(False)
+                pg.mouse.set_visible(True)
+                self.game.change_scene(EndScreen(self.game, victory=False))
+                return
+            self.game.player.pos[0] = 2.0
+            self.game.player.pos[1] = 2.0
+        self.over_processed = True
+        pg.event.set_grab(True)
+        pg.mouse.set_visible(False)
+        self.game.player.playing_chess = False
+        if self.game.maze_scene is not None:
+            self.game.change_scene(self.game.maze_scene)
+ 
+    def render(self):
+        game = self.game
+        game.graphic3d.ctx.clear(0.05, 0.05, 0.1)
+        game.graphic3d.ctx.enable(game.graphic3d.ctx.DEPTH_TEST)
+
+        width, height = game.graphic2d_surf.get_size()
+        aspect_ratio = width / max(1, height)
+        projection = matrix44.create_perspective_projection_matrix(90.0, aspect_ratio, 0.1, 200.0)
+        game.graphic3d.prog["m_proj"].write(projection.astype("float32"))
+        game.graphic3d.prog["m_view"].write(self.view.astype("float32"))
+        for name, target in self.targets.items():
+            target.render()
+       
+        for net in self.nets[:]:
+            model = matrix44.create_from_translation(net.pos)
+            size = net.radius + abs((1 - self.game.player.fps_difficulty))
+            scale = matrix44.create_from_scale(np.array([size, size, size], dtype=np.float32))
+            final_model = matrix44.multiply(scale, model)
+            game.graphic3d.prog["m_model"].write(final_model.astype("float32"))
+            game.graphic3d.prog["u_color"].value = (0.0, 1.0, 1.0)
+            game.graphic3d.vao.render()
+        
+        if self.hitbox_show:
+            for target in self.targets.values():
+                if target.captured: continue
+                scale = matrix44.create_from_scale([
+                 target.width,
+                 target.height,
+                 target.z_depth
+                ])
+                trans_mat = matrix44.create_from_translation(target.pos + target.hitbox_center)
+                model = matrix44.multiply(scale, trans_mat)
+                self.game.graphic3d.prog["m_model"].write(model.astype('float32'))
+                self.game.graphic3d.prog["u_color"].value = (0.0, 1.0, 0.0)
+                self.hitbox_vao.render(mode=mgl.LINE_LOOP)
+
+        surf = game.graphic2d_surf
+        surf.fill((0, 0, 0, 0))
+        cx = width // 2
+        cy = height // 2
+        pg.draw.line(surf, (255, 50, 50), (cx - 15, cy), (cx + 15, cy), 2)
+        pg.draw.line(surf, (255, 50, 50), (cx, cy - 15), (cx, cy + 15), 2)
+       
+        elapsed = time.time() - self.start_time
+        time_left = max(0, self.time_limit - elapsed)
+        font = pg.font.Font(None, 40)
+        timer_txt = font.render(f"Time: {time_left:.1f}s", True, (255, 255, 255))
+        surf.blit(timer_txt, (20, 20))
+        y_offset = 70
+ 
+        for name, target_obj in self.targets.items():
+            color = (0, 255, 0) if target_obj.captured else (100, 100, 100)
+            status_txt = font.render(name, True, color)
+            surf.blit(status_txt, (20, y_offset))
+            y_offset += 40
+        game.graphic3d.render_2d_surf(surf)
+
+============================================================
+SOURCE FILE: ui.py
+============================================================
+
+import pygame as pg
+
+WHITE = (255, 255, 255)
+GRAY = (200, 200, 200)
+BLACK = (0, 0, 0)
+BLUE = (0, 100, 255)
+DARK_GRAY = (100, 100, 100)
+
+class UI_MANAGER:
+    def __init__(self, surface):
+        self.elements = []
+        self.enable = True
+        self.surface = surface
+    
+    def add_element(self, cls, txt, on_click=None, alignment='CENTER_BOTH', 
+                    x_offset=0, y_offset=0, **kwargs):
+        WIDTH, HEIGHT = self.surface.get_size()
+        w, h = kwargs.pop('width', 200), kwargs.pop('height', 50)
+        
+        if 'CENTER_BOTH' in alignment:
+            x = (WIDTH - w)//2
+            y = (HEIGHT - h)//2
+        else:
+            if 'CENTER_X' in alignment: x = (WIDTH - w)//2
+            elif 'LEFT' in alignment: x = 50
+            elif 'RIGHT' in alignment: x = WIDTH - w - 50
+            else: x = (WIDTH - w)//2
+            
+            if 'TOP' in alignment: y = 50
+            elif 'BOTTOM' in alignment: y = HEIGHT - 50 - h
+            elif 'CENTER_Y' in alignment: y = (HEIGHT - h) // 2
+            else: y = (HEIGHT - h) // 2
+
+        element = cls(x, y, w, h, self.surface, alignment=alignment, x_offset=x_offset, y_offset=y_offset, on_click=on_click, text=txt, **kwargs)
+        self.elements.append(element)
+        return element
+
+    def handle_event(self, event):
+        if self.enable:
+            for element in self.elements:
+                element.handle_event(event)
+
+    def handle_resize(self, n_width, n_height, n_surface):
+        self.surface = n_surface
+        for element in self.elements:
+            element.surface = self.surface
+            if hasattr(element, 'alignment'):
+                w, h = element.width, element.height
+                
+                if 'CENTER_BOTH' in element.alignment:
+                    x = (n_width - w) // 2
+                    y = (n_height - h) // 2
+                else:
+                    if 'CENTER_X' in element.alignment: x = (n_width - w) // 2
+                    elif 'LEFT' in element.alignment: x = 50
+                    elif 'RIGHT' in element.alignment: x = n_width - w - 50
+                    else: x = element.base_x
+                    
+                    if 'TOP' in element.alignment: y = 50
+                    elif 'BOTTOM' in element.alignment: y = n_height - 50 - h
+                    elif 'CENTER_Y' in element.alignment: y = (n_height - h) // 2
+                    else: y = element.base_y
+                
+                element.base_x, element.base_y = x, y
+                element.rect.x = x + element.x_offset
+                element.rect.y = y + element.y_offset
+                
+                if hasattr(element, 'update_knob_pos'):
+                    element.update_knob_pos()
+
+    def update(self):
+        if self.enable:
+            for element in self.elements:
+                element.update()
+
+    def draw(self):
+        if self.enable:
+            for element in self.elements:
+                element.draw()
+
+class UI:
+    def __init__(self, x, y, width, height, surface, x_offset, y_offset, alignment):
+        self.base_x = x
+        self.base_y = y
+        self.rect = pg.Rect(x + x_offset, y + y_offset, width, height)
+        self.hovered = False
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.surface = surface
+        self.x_offset = x_offset
+        self.y_offset = y_offset
+        self.alignment = alignment
+
+    def update(self):
+        self.hovered = self.rect.collidepoint(pg.mouse.get_pos())
+
+class Slider(UI):
+    def __init__(self, x, y, width, height, surface, alignment="", x_offset=0, y_offset=0, initial_val=0.5, text="", **kwargs):
+        super().__init__(x, y, width, height, surface, x_offset, y_offset, alignment)
+        self.value = initial_val
+        self.text = text
+        self.font = pg.font.Font(None, 28)
+        self.dragging = False
+        self.knob_width = 15
+        self.knob = pg.Rect(x, y, self.knob_width, height + 10)
+        self.update_knob_pos()
+
+    def update_knob_pos(self):
+        min_x, max_x = self.rect.left, self.rect.right
+        center_x = self.rect.x + (self.rect.width * self.value)
+        half = self.knob_width // 2
+        center_x = max(min_x + half, min(center_x, max_x - half))
+        self.knob.centerx = int(center_x)
+        self.knob.centery = self.rect.centery
+
+    def handle_event(self, event):
+        if event.type == pg.MOUSEBUTTONDOWN:
+            if self.knob.collidepoint(event.pos) or self.rect.collidepoint(event.pos):
+                self.dragging = True
+                self.update_val(event.pos[0])
+        elif event.type == pg.MOUSEBUTTONUP:
+            self.dragging = False
+        elif event.type == pg.MOUSEMOTION and self.dragging:
+            self.update_val(event.pos[0])
+
+    def update_val(self, mouse_x):
+        x = mouse_x - self.rect.x
+        x = max(0, min(x, self.rect.width))
+        self.value = x / self.rect.width
+        self.update_knob_pos()
+
+    def get_val(self, min_val=0, max_val=100):
+        return min_val + (max_val - min_val) * self.value
+
+    def draw(self):
+        pg.draw.rect(self.surface, GRAY, self.rect, border_radius=5)
+        filled_width = int(self.rect.width * self.value)
+        fill_rect = pg.Rect(self.rect.x, self.rect.y, filled_width, self.rect.height)
+        pg.draw.rect(self.surface, BLUE, fill_rect, border_radius=5)
+        pg.draw.rect(self.surface, WHITE, self.knob, border_radius=5)
+        pg.draw.rect(self.surface, BLACK, self.knob, 2, border_radius=5)
+        if self.text:
+            display_text = f"{self.text}: {int(self.value * 100)}%"
+            text_surf = self.font.render(display_text, True, WHITE)
+            self.surface.blit(text_surf, (self.rect.x, self.rect.y - 25))
+
+class Button(UI):
+    def __init__(self, x, y, width, height, surface, on_click, alignment="", x_offset=0, y_offset=0, ACTIVE_COLOR=(255, 255, 255), text="Button", toggle=False, **kwargs):
+        super().__init__(x, y, width, height, surface, x_offset, y_offset, alignment)
+        self.toggle = toggle
+        self.is_active = False
+        self.text = text
+        self.font = pg.font.Font(None, 32)
+        self.ACTIVE_COLOR = ACTIVE_COLOR
+        self.on_click = on_click
+
+    def handle_event(self, event):
+        if event.type == pg.MOUSEBUTTONDOWN:
+            if self.rect.collidepoint(event.pos):
+                if self.toggle:
+                    self.is_active = not self.is_active
+                    self.on_click()
+                else:
+                    self.is_active = True
+        if event.type == pg.MOUSEBUTTONUP:
+            if not self.toggle and self.rect.collidepoint(event.pos):
+                self.on_click()
+            if not self.toggle:
+                self.is_active = False
+
+    def draw(self):
+        if self.is_active:
+            color = self.ACTIVE_COLOR
+        elif self.hovered:
+            color = DARK_GRAY
+        else:
+            color = GRAY
+        pg.draw.rect(self.surface, color, self.rect, border_radius=5)
+        pg.draw.rect(self.surface, BLACK, self.rect, 2, border_radius=5)
+        txt_surface = self.font.render(self.text, True, BLACK)
+        txt_rect = txt_surface.get_rect(center=self.rect.center)
+        self.surface.blit(txt_surface, txt_rect)
+
+class UserTxtInput(UI):
+    def __init__(self, x, y, width, height, surface, alignment="", x_offset=0, y_offset=0, txt_size=32, is_password=False,
+                 b_color_active=(0, 100, 255), b_color_n=(0, 0, 0),
+                 limits="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890 _-",
+                 extendable=False, **kwargs):
+        super().__init__(x, y, width, height, surface, x_offset, y_offset, alignment)
+        self.active = False
+        self.txt = ""
+        self.limitations = limits
+        self.is_password = is_password
+        self.font = pg.font.Font(None, txt_size)
+        self.b_color_active = b_color_active
+        self.b_color_n = b_color_n
+        self.extendable = extendable
+        self.min_width = width
+
+    def handle_event(self, event):
+        if event.type == pg.MOUSEBUTTONDOWN:
+            self.active = self.rect.collidepoint(event.pos)
+        if event.type == pg.KEYDOWN and self.active:
+            if event.key == pg.K_RETURN:
+                self.active = False
+            elif event.key == pg.K_BACKSPACE:
+                self.txt = self.txt[:-1]
+            else:
+                space_allowed = self.surface.get_width() - self.rect.x - 10
+                n_txt = self.txt + event.unicode
+                if self.font.size(n_txt)[0] <= space_allowed:
+                    if event.unicode in self.limitations:
+                        self.txt = n_txt
+
+    def draw(self):
+        b_color = self.b_color_active if self.active else self.b_color_n
+        pg.draw.rect(self.surface, WHITE, self.rect)
+        pg.draw.rect(self.surface, b_color, self.rect, 2)
+        display_txt = "*" * len(self.txt) if self.is_password else self.txt
+        if self.txt == "" and not self.active:
+            txt_surface = self.font.render("Enter Here...", True, (211, 211, 211))
+        else:
+            txt_surface = self.font.render(display_txt, True, BLACK)
+
+        if self.extendable:
+            n_width = txt_surface.get_width() + 20
+            self.rect.width = max(self.min_width, n_width)
+            if self.rect.x + self.rect.width > self.surface.get_width():
+                self.rect.width = self.surface.get_width() - self.rect.x
+
+        self.surface.blit(txt_surface, (self.rect.x + 5, self.rect.centery - txt_surface.get_height() // 2))
+
+    def clear(self):
+        self.txt = ""
